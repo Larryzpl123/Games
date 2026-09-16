@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Helping Hand</title>
+<!--
+  Helping Hand - HTML version. Open this file in any browser; everything (code + sprites) is inside.
+  Base game (Ludo Lodge Project 2) + Challenges 1-5 (green switch/door, move counter, title screen,
+  green crates, multiple hands) + revisions: particle effects, undo / timed spikes / teleporters,
+  star rating against par.
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #1c1d26; color: #f0f0f5; font-family: "Segoe UI", Helvetica, Arial, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; }
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; max-width: 100vw; max-height: 100vh; outline: none; }
+  #touch { display: none; gap: 6px; margin: 8px; }
+  #touch button { width: 56px; height: 56px; font-size: 22px; background: #2c2e3a; color: #fff; border: 1px solid #555; border-radius: 8px; }
+  @media (pointer: coarse) { #touch { display: grid; grid-template-columns: repeat(3, 56px); } }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0"></canvas>
+<div id="touch">
+  <button data-k="z">Z</button><button data-k="ArrowUp">▲</button><button data-k="r">R</button>
+  <button data-k="ArrowLeft">◀</button><button data-k="ArrowDown">▼</button><button data-k="ArrowRight">▶</button>
+</div>
+<script>
+// ---------------------------------------------------------------------------
+//  Helping Hand - rules engine (1:1 port of the Python hh_engine)
+// ---------------------------------------------------------------------------
+const DIRS = { left: [-1, 0], right: [1, 0], up: [0, -1], down: [0, 1] };
+const SPIKE_PERIOD = 4;
+const CRATE = "crate", SLIDING = "sliding", GREEN = "green";
+
+const K = (x, y) => x + "," + y;                 // grid pos -> map key
+const P = (k) => k.split(",").map(Number);       // map key -> [x, y]
+
+function spikePhase(moves) { return moves % SPIKE_PERIOD; }
+function spikesUp(moves) { return spikePhase(moves) >= 2; }
+
+class Level {
+  constructor(data) {
+    this.name = data.name; this.par = data.par || 0; this.hint = data.hint || "";
+    const rows = data.map;
+    this.h = rows.length; this.w = Math.max(...rows.map(r => r.length));
+    this.walls = new Set(); this.pits = new Set(); this.goals = new Set(); this.spikes = new Set();
+    this.redSwitches = new Set(); this.greenSwitches = new Set();
+    this.redDoors = new Set(); this.greenDoors = new Set();
+    this.teleporters = new Map(); this.teleId = new Map();
+    const hands = [], crates = new Map(), tele = {};
+    rows.forEach((row, y) => {
+      [...row].forEach((ch, x) => {
+        const k = K(x, y);
+        if (ch === "#") this.walls.add(k);
+        else if (ch === "H") hands.push(k);
+        else if (ch === "C") crates.set(k, CRATE);
+        else if (ch === "S") crates.set(k, SLIDING);
+        else if (ch === "G") crates.set(k, GREEN);
+        else if (ch === "O") this.pits.add(k);
+        else if (ch === "r") this.redSwitches.add(k);
+        else if (ch === "R") this.redDoors.add(k);
+        else if (ch === "g") this.greenSwitches.add(k);
+        else if (ch === "D") this.greenDoors.add(k);
+        else if (ch === "X") this.goals.add(k);
+        else if (ch === "^") this.spikes.add(k);
+        else if (ch === "1" || ch === "2") (tele[ch] = tele[ch] || []).push(k);
+      });
+    });
+    for (const ch in tele) {
+      const [a, b] = tele[ch];
+      this.teleporters.set(a, b); this.teleporters.set(b, a);
+      this.teleId.set(a, ch); this.teleId.set(b, ch);
+    }
+    this.start = new State(hands, crates);
+  }
+  redOpen(crates) { for (const p of this.redSwitches) if (crates.has(p)) return true; return false; }
+  greenOpen(crates) { for (const p of this.greenSwitches) if (crates.has(p)) return true; return false; }
+  solid(p, red, green) {
+    if (this.walls.has(p)) return true;
+    if (this.redDoors.has(p) && !red) return true;
+    if (this.greenDoors.has(p) && !green) return true;
+    return false;
+  }
+}
+
+class State {
+  constructor(hands, crates, filled, moves, dead, sprites) {
+    this.hands = [...hands];
+    this.crates = new Map(crates);
+    this.filled = new Set(filled || []);
+    this.moves = moves || 0;
+    this.dead = !!dead;
+    this.sprites = sprites ? [...sprites] : this.hands.map(() => "hand");
+  }
+  copy() { return new State(this.hands, this.crates, this.filled, this.moves, this.dead, this.sprites); }
+  solved(level) { return !this.dead && this.hands.every(h => level.goals.has(h)); }
+}
+
+function add(k, d) { const [x, y] = P(k); return K(x + d[0], y + d[1]); }
+
+function freeForCrate(level, st, p, red, green) {
+  return !level.solid(p, red, green) && !st.crates.has(p) && !st.hands.includes(p);
+}
+
+function tryTeleport(level, st, p, events, who) {
+  if (level.teleporters.has(p)) {
+    const ex = level.teleporters.get(p);
+    if (!st.crates.has(ex) && !st.hands.includes(ex)) {
+      events.push(["teleport", who, p, ex]);
+      return ex;
+    }
+  }
+  return p;
+}
+
+function placeCrate(level, st, p, ctype, events) {
+  if (level.pits.has(p) && !st.filled.has(p)) {
+    st.filled.add(p); events.push(["fill", p]); return;
+  }
+  p = tryTeleport(level, st, p, events, "crate");
+  st.crates.set(p, ctype);
+}
+
+function slide(level, st, start, d, events) {
+  let cur = start;
+  for (;;) {
+    const red = level.redOpen(st.crates), green = level.greenOpen(st.crates);
+    const nxt = add(cur, d);
+    if (!freeForCrate(level, st, nxt, red, green)) break;
+    events.push(["slide", cur, nxt]);
+    cur = nxt;
+    if (level.pits.has(cur) && !st.filled.has(cur)) {
+      st.filled.add(cur); events.push(["fill", cur]); return;
+    }
+    cur = tryTeleport(level, st, cur, events, "crate");
+  }
+  st.crates.set(cur, SLIDING);
+}
+
+function move(level, st, dname) {
+  const d = DIRS[dname];
+  const nw = st.copy();
+  const events = [];
+  const order = nw.hands.map((_, i) => i).sort((a, b) => {
+    const pa = P(nw.hands[a]), pb = P(nw.hands[b]);
+    return (pb[0] * d[0] + pb[1] * d[1]) - (pa[0] * d[0] + pa[1] * d[1]);
+  });
+  let movedAny = false;
+  for (const i of order) {
+    const p = nw.hands[i];
+    const q = add(p, d);
+    const red = level.redOpen(nw.crates), green = level.greenOpen(nw.crates);
+    if (level.solid(q, red, green)) continue;
+    if (level.pits.has(q) && !nw.filled.has(q)) continue;
+    if (nw.hands.includes(q)) continue;
+    const ctype = nw.crates.get(q);
+    if (ctype !== undefined && !(ctype === GREEN && !green)) {
+      const r = add(q, d);
+      if (!freeForCrate(level, nw, r, red, green)) continue;
+      nw.crates.delete(q);
+      events.push(["push", ctype, q, r]);
+      if (ctype === SLIDING) slide(level, nw, q, d, events);
+      else placeCrate(level, nw, r, ctype, events);
+      nw.sprites[i] = "push_" + dname;
+    } else {
+      nw.sprites[i] = "hand";
+    }
+    events.push(["step", i, p, q]);
+    nw.hands[i] = tryTeleport(level, nw, q, events, "hand");
+    movedAny = true;
+  }
+  if (movedAny) {
+    nw.moves += 1;
+    if (level.spikes.size && spikesUp(nw.moves)) {
+      for (const h of nw.hands) if (level.spikes.has(h)) { nw.dead = true; events.push(["spike", h]); }
+    }
+  }
+  return [nw, events, movedAny];
+}
+
+function starsFor(moves, par) {
+  if (moves <= par) return 3;
+  if (moves <= par + Math.max(2, Math.floor(par / 2))) return 2;
+  return 1;
+}
+
+
+const LEVELS = [{"name": "First Steps", "par": 7, "hint": "Arrow keys move. Push the crate into the pit to cross.", "map": ["##########", "#H.......#", "#...C....#", "#........#", "####O#####", "#...X....#", "##########"]}, {"name": "Red Switch", "par": 24, "hint": "Sliding crates slide until they hit something. A crate on a red switch opens red doors.", "map": ["############", "#H.....R...#", "#.....C#...#", "#.S..r.#.X.#", "#......#...#", "#......#...#", "############"]}, {"name": "Green Light", "par": 12, "hint": "Green crates are ghosts until a crate sits on a green switch.", "map": ["############", "#H.....#####", "#.C..G.D.OX#", "#..g...#####", "#......#####", "############"]}, {"name": "Portal", "par": 12, "hint": "Anything that steps on a portal comes out of its twin (if the twin is free).", "map": ["############", "#H....#....#", "#.....#1...#", "#.....#...O#", "#.S1..#..#X#", "#.....#..###", "############"]}, {"name": "Spikes", "par": 15, "hint": "Spikes rise every 2 moves. Don't stand on a raised spike. Z undoes.", "map": ["############", "#H....#....#", "#.##..#..#.#", "#....^^....#", "#.##..#..#.#", "#.....#...X#", "############"]}, {"name": "Two Hands", "par": 15, "hint": "Both hands move together. Every hand must stand on a goal.", "map": ["############", "#H....##...#", "#.....##...#", "#.C...##.X.#", "#H....##...#", "#....O..X..#", "############"]}, {"name": "Helping Hands", "par": 32, "hint": "Everything at once. Good luck.", "map": ["##############", "#H.....#######", "#..C...#^G.O.#", "#..r...R^###X#", "#......#######", "#.S....#######", "#H.....#######", "#.g1...##1OX##", "##############"]}];
+const ASSETS = {"crate": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcklEQVR4nO2XsQoAMQhDK/iL95X3kZaDyyJ1s+qQLHYyz0BBdf0ye2wVSuSVr2ql6UnqJwdZdiK+L2p/AnjcmhxCX+8zJ4GqX+B95iRAAAIQgAAEIAABCECA21tx5DMngWhvz1LUtz+B6GbLVnSDtiewAV9ZQ7+oAHO8AAAAAElFTkSuQmCC", "floor": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgklEQVR4nGM0MXP5zzCAgIWBgYHhx49vA2I5BwcXA9OA2IwERh0w6oDB7wA+PoGBdcCnTx8G1gG0BqMOGL4OIDb30MwBxOae4RsFow4g2wG0LvsJOoDWZT9BB9AbDF0HUCutkO0AaqUVukUBrhCjmwNwhdjQTYTDxgEsDAyQXupAAQAfmBQL6SL98wAAAABJRU5ErkJggg==", "goal": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAVUlEQVR4nO3V0QkAIAhFUYX2X9kGyEghsuL6GQ86iGgTEZPCapWfA3ABZv5IqKr7ns0vAacLAIABsGvao/n7OgAAALcAAABuAQAAs4ru9mz+nQ58C+hC3xmMlqWg3QAAAABJRU5ErkJggg==", "green_crate": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcklEQVR4nO2XsQoAMQhDW/AX+5X9yB4Hl0Uum1WHZLGTeQYKauPTOuuMRO2551st0/RP5icHWXQivi9qfQJ43JocQl/v0yeBrF/gffokIAABCEAAAhCAAAQggNtbMfPpkwDb26PE+tYnwG62aLEbtDyBB1VrPxkw+sjzAAAAAElFTkSuQmCC", "green_crate_inactive": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAiUlEQVR4nO2XQQ6AIAwEIeGLvJJHYkzspXVjgoX2sHNBPJRh7aG28tBnn+Ugo456r+3koW80fXMxk/eyX0XXkb2s8QnIgzb0BiWRJwHUC39B394IRGF6YBe6fr4eoAAFKEABClCAArsmIlTfCEQBp2Lv/wJ0Tp4E0NzuBaobn8DX3O6VBOqF8AQuFnBdwdhjenQAAAAASUVORK5CYII=", "green_door": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAArElEQVR4nO1XQQ7AIAibiV/0lT7SnbgwG6EjkRh7mluQ0sHsahttPBP00svsPguUp0YmYfAhIJWzyqzi9PM8CmiGqFJUod4Hxek8+xWwVi5A79IbJ+v9CngDUA9YFfxNIBqXwPI7sJp7DTQdqEfyKKDhrZzdJ68ClwA7Bd598iiA5lSvWT9wzml4CbCOKIxANCo6/byu2BqXzxXLhdUHnPtnJGDdrcDbO9sVeAHJwJcpveNC9QAAAABJRU5ErkJggg==", "green_door_open": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAaklEQVR4nO2XMRIAEAwEmfFFr/RIqjSHxhAp9iqjSDZbJaX22tMiLbe8+j/Nrk+52eQkE8DtybWumohj4NXkGjXx34DX5Brr+98AAAAAAAAAAAAAAAC2nXrvhnG2Ynt4mYh7GVlemQh7HQ9jUyiBUlgD6wAAAABJRU5ErkJggg==", "green_switch": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAlklEQVR4nO2WQQrAMAgEU8gb+8h+sj15WdhqgiYYnGNrYVYTaW+b6SVQAvkEnvb+vr/bFSvgjC5gTSx1WK90JEEHBEzKkmGdm0AQXAATYHI2a+07s8AidAE0Z7PVOjQtEIx9DwxuOGsnEnRAmL0FbgJBcAG2+diZsNaZBRYxfga05+ecAYHNmiU9748IGd2I7gLOlEAJfJfTNs6xIJF4AAAAAElFTkSuQmCC", "hand": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgElEQVR4nO2VuwrAIAwAW/D/f9naIYsgiTFPyS1C6XC5htoeZ1oJpBPog/98By4C0qAC88Rwzs+5ZeIX4E5IfT9+gRXUXcBK5Clwuu3HAlqICUAZNwEuSwHsW2MTU4vELaC19WQBK0pg+zY0F9CmBNi3obmAFtsC0n/EfAWuE/gADHhEjUOsx+YAAAAASUVORK5CYII=", "hand_push_down": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcUlEQVR4nO2VMQ4AIAgDNfH/X1YXF6aiNIrpzQ5HqaGVyzQJSEACEkgj0CfIuzqhCLCQQLjA6grahfcTQNtPE2BDE0C78E8CdlK0O/kTWJPv/pY8CdhJ7c69V9AtwOJYwCby3y3Y3W2YABu3QHQi1xMYc94kjWaZTP4AAAAASUVORK5CYII=", "hand_push_left": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgUlEQVR4nO2VOQ7AIAwEg8T/vxxo7IIIORibpdhtKDg0Hq76gFMJQAACXAfw9qwsUHpCAU7nAzBWZBmZ9f81c4+B1b0PB0BFAWZ7lm0Gb8A6xdJmmcAbsO6rVJ5lAm9g9yXzjlcAz6TImGdAMpra/QUVIGKRVICoSt0A2SEAAQjQAAJaLInkJE2vAAAAAElFTkSuQmCC", "hand_push_right": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcElEQVR4nO2VQQrAIAwEK/j/L2suvSxdklrakrhzVJHJGmI/fqZLQAISKCMwjKv1ZnwisMqygFcx7rPzeRJgFURhvZAngShnUlhx/h64CyaxTw8g3ryon0Cdv4BV4k1I3Md78iTA8N74dYGnSEACEpjauCyB6LIh5QAAAABJRU5ErkJggg==", "hand_push_up": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgUlEQVR4nO2WQQrAIAwEW/D/X6724CVUEjdZISVzEUFhsoZgu4w8g3e9B197lOa5HEGYAJrIfxKQWBPJk4CsxNv92wIsVIH5lhI5D7TzsAAbuAd2K3ULsDALRFUMC7BQBVbdfkyADU3AOinzJMDqhTwJlMAk6h8AC0RTAiVQAiXQAYyoLIUFdOadAAAAAElFTkSuQmCC", "pit": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAh0lEQVR4nO1X0QrAIAj0wd/s6/rQbTDcgyJFm7rpDqIuo844IhEAtqNBa+CK3s8efY+VQJ45KaN5ax5/AzTwzlwIiMIlgCslPMXrekDbXwiIgpkH8r4Ds8jrgdF6LZ7PA7Nxbb0QEIVlD4zi+T0wQj4P1P0T8vhd/h0P/HVBnbpAU2bNX1Md75yqsVRX0LcOAAAAAElFTkSuQmCC", "pit_filled": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcUlEQVR4nO2XMQ7AMAgDGfhmXpeHtlElL1TeCDDYSzLhwxIS+Fr22NHeVqrj+8lrbf/y2DnIshOJdfH2J4DPrc4h1I0+cxKomoLoMycBAQhAAAIQgAAEIAAB3N6Kmc+cBNjeniVWtz8BdrNli92g7Qm8t7chJCR/nHEAAAAASUVORK5CYII=", "portal_1": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABDElEQVR4nOVXwQ3CMAxMEJN1DF4dgxEYgxdjsFp5gaL0fPY5qYRUP+vk7mI7jlvK2a2qG273bWP+16NKmOHFHnFWiLtIJVaFUKdFboGq66mAHkzNbXT/5QhytMeKzg44Qv58Y7B12a/18GAEMuSWTyrCVm2/sQfvT+v5LewrU4cMhbn9ziKE7JcCdt+/oBa5KqTlgjXQhsjLebQmpGuIjOXcyz+zsACLnH07TMBMSwlAIVbCnhLA8uz1BFlAe03YydalVs+PMKEA1jKVJhPpGUOd0CLI3gL6eqmPERLmYdIiRHmL5pxhtBYarTIDSRTHfQsQ0CzyUv55KPVAozY0lo8ImfZjogrJFux57QNWN9QwJgvYtgAAAABJRU5ErkJggg==", "portal_2": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABCklEQVR4nOVXwRHCMAxLOaboJLw7FSMwFW8mYY3wopcWWbac9I67+lnHkmI7TlrK2W1SA+r9VSng4yZhhhd7xFkh7iKVWBVCnRa5BaqupwL2YGpto/GXI8hRjJmdDHl9vjHYMst4MAMZcssnNWGr9ieFO/D9bl2/gX1l6qBikOb2O8sQsrUE7Lx/QS1yVUjLBXugTZFX82hPSMcQiiI19+rPLCzAImffDhMw0lICUIqVtKcEsDp7M0EWsBkaZGfTMk+eH2FCAfTKFIZMZGZ0TUKLIHsK6O2lXkZImIdJmxDVLVpzhrGJiRBnHiRRHPcuQECjyEv550epBxq1rmd5j5BhPyaqkGzDntc+bvnUMBHO39gAAAAASUVORK5CYII=", "red_door": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAArElEQVR4nO1XQQ7AIAibiV/0lT7SnbgwG6EjkRh7mluQ0sHs6mhtPBOU3svsPguUp0YmYfAhIJWzyqzi9PM8CmiGqFJUod4Hxek8+xWwVi5A79IbJ+v9CngDUA9YFfxNIBqXwPI7sJp7DTQdqEfyKKDhrZzdJ68ClwA7Bd598iiA5lSvWT9wzml4CbCOKIxANCo6/byu2BqXzxXLhdUHnPtnJGDdrcDbO9sVeAHKapcpI8WJQwAAAABJRU5ErkJggg==", "red_door_open": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAaklEQVR4nO2XMRIAEAwEmfFFr/RIqjSHxhAp9iqjSDZbJaXX2tMiubW8+j/Nrk+52eQkE8DtybWumohj4NXkGjXx34DX5Brr+98AAAAAAAAAAAAAAAC2nXrvhnG2Ynt4mYh7GVlemQh7HQ9jUyiBIvzHdgAAAABJRU5ErkJggg==", "red_switch": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAl0lEQVR4nO2WQQ6AMAgEMekbfaSf1BOXTVZoA7U2zFExmQXa2ORjWgmUwO8ELpH77f0pcqQKRGMKeBNrHdZbHVm/AwomZcmwLkwgCyqACTA5m7X1nVtgFqYAmrPZWh0aFsjGfQ/03nDeTqzfAWX0FIQJZEEF2M3HdsJb5xaYRfcOWM/32QGFzZol3e+PCOlNGC4QTQmUwAOyJTbOJAZe3AAAAABJRU5ErkJggg==", "sliding_crate": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAw0lEQVR4nM1XWwrAIAyb4BV3yh3SMVh/6kKqdJr8CLN0SVpf9XhxttaOhbhKKc9YV/70C5UpN6YGH8/mESxuvwNowpQhRV75bB4dB1Ato0pRPOoZvR5g3Y3glY/2jI4DBsSUKRvtGUhgNSgBVuPZ1RIm8Dc6AmzdzipF+XQcyK4xy9cR2IVuJ8yuMTsbdBzIrnE0n44DHtl7v/6NyBC99WbdlHQcYGeA/+4R7RlIYBeGVwGLG30p7XeA1ciDxUXzyLyObziMzFm5970xAAAAAElFTkSuQmCC", "spike_down": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAZElEQVR4nGNgGAUDDBiROW4eIf/pYemuHWvg9rKgS0pJSdHU8mfPnqHwmWhqGxFg1AGjDhh1wKgDRh0w6oBRB4w6YNQBow7AaBWjgzu3bsDZKmoaVJFDBoMvBNDb7bSWGwUDDgCFeRsCiM043wAAAABJRU5ErkJggg==", "spike_up": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAq0lEQVR4nGNgGAUDDBiROW4eIf/pYemuHWvg9rKgS0pJSdHU8mfPnqHwmWhqGxGAKAc01tdSXY4kB9ASDH4HwIIRW3CSK0eSA2gNhoYD7kYHUl2OJAfQEgxuB6CnYGQ+uXIkOYAegKADYAkJW4IiV44kB9AaDLgDMNoDMIAr4VBSM9Y3NmOID3gIjDpgcDsAPQ8j88mVI8oBxLTlyAHYzB18UYDebh8Fwx4AAEBZQbXtX1fQAAAAAElFTkSuQmCC", "spike_warn": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAoklEQVR4nGNgGAUDDBiROW4eIf/pYemuHWvg9rKgS0pJSdHU8mfPnqHwmWhqGxFg1AGjDhh1wKgDRh0w6oBRBxDlgLaYc1SXI8kBtAQEHQDzBTbfkCtHkgNoDfA6AN31yHxy5UhyAD0ARrMc1iomJgWTCqqWGDE8e/YMpVk+4CGA0S+AtdsTuiQYGBgYGL59+QSX4+LhQ1FLuhxqn2AUDAoAAPkiOCFQjvmtAAAAAElFTkSuQmCC", "wall": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAUklEQVR4nO3WMQoAIAxD0Q69oh5SD6lSKAjOmsGfrVMfgUK9FRsmjCuXAwhA7WKAdv0GWNcQyUZuzwdAFQAAAAAAAAAAAAAAPL/VzOtZ38D3gAnfVBl4frtHbAAAAABJRU5ErkJggg=="};
+</script>
+<script>
+// ---------------------------------------------------------------------------
+//  Canvas front end
+// ---------------------------------------------------------------------------
+const T = 64, HUD_H = 60, ANIM_MS = 110;
+const BG = "#1c1d26", HUD_BG = "#12131a", WHITE = "#f0f0f5", GREY = "#9698a5", YELLOW = "#fadc50", RED = "#f05a5a";
+const SPRITES = {
+  hand: "hand", push_left: "hand_push_left", push_right: "hand_push_right", push_up: "hand_push_up", push_down: "hand_push_down",
+  wall: "wall", floor: "floor", crate: "crate", sliding: "sliding_crate", green: "green_crate", green_inactive: "green_crate_inactive",
+  pit: "pit", pit_filled: "pit_filled", goal: "goal", red_switch: "red_switch", red_door: "red_door", red_door_open: "red_door_open",
+  green_switch: "green_switch", green_door: "green_door", green_door_open: "green_door_open",
+  spike_down: "spike_down", spike_warn: "spike_warn", spike_up: "spike_up", portal_1: "portal_1", portal_2: "portal_2",
+};
+const lerp = (a, b, t) => a + (b - a) * t;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const now = () => performance.now();
+
+class Game {
+  constructor(canvas) {
+    this.cv = canvas; this.ctx = canvas.getContext("2d");
+    this.levels = LEVELS.map(d => new Level(d));
+    this.W = Math.max(...this.levels.map(l => l.w)) * T;
+    this.H = Math.max(...this.levels.map(l => l.h)) * T + HUD_H + 8 + 40;
+    canvas.width = this.W; canvas.height = this.H;
+    this.img = {};
+    let pending = 0;
+    for (const key in SPRITES) {
+      const im = new Image(); pending++;
+      im.onload = () => { if (--pending === 0) this.ready = true; };
+      im.src = ASSETS[SPRITES[key]];
+      this.img[key] = im;
+    }
+    this.scene = "title"; this.levelIndex = 0; this.stars = [];
+    this.particles = []; this.texts = []; this.handAnim = new Map(); this.crateAnim = new Map(); this.ghosts = [];
+    this.shake = 0; this.last = now();
+    this.seedSprites = Array.from({ length: 14 }, (_, k) => ({ sp: rnd(15, 40), x: rnd(0, this.W), y: rnd(0, this.H), key: ["crate", "sliding", "green", "hand"][k % 4] }));
+    window.addEventListener("keydown", e => {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+      this.key(e.key);
+    });
+    document.querySelectorAll("#touch button").forEach(b => b.addEventListener("click", () => this.key(b.dataset.k)));
+    requestAnimationFrame(() => this.loop());
+  }
+
+  // ---------------- level handling ----------------
+  loadLevel(i) {
+    this.levelIndex = i; this.level = this.levels[i]; this.state = this.level.start.copy();
+    this.undoStack = []; this.handAnim = new Map(); this.crateAnim = new Map(); this.ghosts = [];
+    this.particles = []; this.texts = [];
+    this.prevDoors = [this.level.redOpen(this.state.crates), this.level.greenOpen(this.state.crates)];
+    this.ox = Math.floor((this.W - this.level.w * T) / 2);
+    this.oy = HUD_H + 8 + Math.floor((this.H - HUD_H - 48 - this.level.h * T) / 2);
+    this.scene = "play"; this.clearTime = null;
+  }
+  px(k) { const [x, y] = P(k); return [this.ox + x * T, this.oy + y * T]; }
+  center(k) { const [x, y] = this.px(k); return [x + T / 2, y + T / 2]; }
+  dist(a, b) { const pa = P(a), pb = P(b); return Math.abs(pa[0] - pb[0]) + Math.abs(pa[1] - pb[1]); }
+
+  // ---------------- input ----------------
+  tryMove(dname) {
+    if (this.state.dead) return;
+    const [nw, events, moved] = move(this.level, this.state, dname);
+    if (!moved) return;
+    this.undoStack.push(this.state);
+    this.state = nw;
+    const t = now();
+    for (const e of events) {
+      const k = e[0];
+      if (k === "step") {
+        const [, i, p] = e; this.handAnim.set(i, [p, t]);
+        this.emitDust(this.center(p), 3, [80, 82, 96]);
+      } else if (k === "push") {
+        const [, ctype, q, r] = e;
+        if (ctype !== SLIDING) this.crateAnim.set(r, [q, t, ANIM_MS]);
+        this.emitDust(this.center(q), 10, [120, 100, 70]);
+      } else if (k === "slide") {
+        const [, a, b] = e;
+        const [start, t0] = this.crateAnim.get(a) || [a, t, 0]; this.crateAnim.delete(a);
+        const d = this.dist(start, b);
+        this.crateAnim.set(b, [start, t0, Math.max(ANIM_MS, 60 * d)]);
+        this.emitDust(this.center(a), 2, [120, 100, 70]);
+      } else if (k === "fill") {
+        const [, p] = e;
+        const [start, t0, dur] = this.crateAnim.get(p) || [p, t, ANIM_MS]; this.crateAnim.delete(p);
+        this.ghosts.push(["crate", start, p, t0, dur]);
+        this.emitSplash(this.center(p));
+        this.texts.push({ x: this.center(p)[0], y: this.center(p)[1], text: "FILLED!", life: 0.9, color: "#c8aa78" });
+      } else if (k === "teleport") {
+        const [, who, a, b] = e;
+        this.emitPortal(this.center(a)); this.emitPortal(this.center(b));
+        if (who === "crate") { this.crateAnim.delete(a); this.crateAnim.delete(b); }
+      } else if (k === "spike") {
+        const [, p] = e;
+        this.emitBurst(this.center(p), [240, 80, 80], 30); this.shake = 0.35;
+        this.texts.push({ x: this.center(p)[0], y: this.center(p)[1], text: "OUCH!", life: 0.9, color: RED });
+      }
+    }
+    this.state.hands.forEach((h, i) => {                    // teleported hands: no cross-map tween
+      if (this.handAnim.has(i) && this.dist(this.handAnim.get(i)[0], h) > 1) this.handAnim.delete(i);
+    });
+    const doors = [this.level.redOpen(this.state.crates), this.level.greenOpen(this.state.crates)];
+    if (doors[0] !== this.prevDoors[0]) for (const p of this.level.redDoors) this.emitBurst(this.center(p), [255, 120, 120], 14);
+    if (doors[1] !== this.prevDoors[1]) {
+      for (const p of this.level.greenDoors) this.emitBurst(this.center(p), [120, 255, 140], 14);
+      for (const [p, ct] of this.state.crates) if (ct === GREEN) this.emitBurst(this.center(p), [120, 255, 140], 8);
+    }
+    this.prevDoors = doors;
+    if (this.state.solved(this.level)) {
+      this.scene = "clear"; this.clearTime = t;
+      this.earned = starsFor(this.state.moves, this.level.par);
+      for (const h of this.state.hands) this.emitSparkle(this.center(h));
+    }
+  }
+  undo() {
+    if (!this.undoStack.length) return;
+    this.state = this.undoStack.pop();
+    this.handAnim = new Map(); this.crateAnim = new Map(); this.ghosts = [];
+    this.prevDoors = [this.level.redOpen(this.state.crates), this.level.greenOpen(this.state.crates)];
+    this.texts.push({ x: this.W / 2, y: this.oy + 20, text: "UNDO", life: 0.9, color: GREY });
+  }
+  key(k) {
+    if (this.scene === "title") {
+      if (k === "Enter" || k === " ") { this.stars = []; this.loadLevel(0); }
+    } else if (this.scene === "results") {
+      this.scene = "title";
+    } else if (this.scene === "clear") {
+      if (now() - this.clearTime < 600) return;
+      this.stars.push(this.earned);
+      if (this.levelIndex + 1 < this.levels.length) this.loadLevel(this.levelIndex + 1); else this.scene = "results";
+    } else if (this.scene === "play") {
+      const kl = k.length === 1 ? k.toLowerCase() : k;
+      if (kl === "ArrowLeft" || kl === "a") this.tryMove("left");
+      else if (kl === "ArrowRight" || kl === "d") this.tryMove("right");
+      else if (kl === "ArrowUp" || kl === "w") this.tryMove("up");
+      else if (kl === "ArrowDown" || kl === "s") this.tryMove("down");
+      else if (kl === "z") this.undo();
+      else if (kl === "r") this.loadLevel(this.levelIndex);
+      else if (kl === "Escape") this.scene = "title";
+      else if (kl === "n" && location.hash === "#debug") {      // level skip, testing only
+        this.stars.push(0);
+        if (this.levelIndex + 1 < this.levels.length) this.loadLevel(this.levelIndex + 1); else this.scene = "results";
+      }
+    }
+  }
+
+  // ---------------- particles ----------------
+  add(x, y, vx, vy, life, color, size, grav = 0, shape = "rect") {
+    this.particles.push({ x, y, vx, vy, life, maxLife: life, color, size, grav, shape });
+  }
+  emitDust([cx, cy], n, color) {
+    for (let i = 0; i < n; i++) { const a = rnd(0, Math.PI * 2), s = rnd(10, 40); this.add(cx, cy + T * 0.3, Math.cos(a) * s, Math.sin(a) * s - 10, rnd(0.25, 0.5), color, rnd(2, 5)); }
+  }
+  emitSplash([cx, cy]) {
+    const cols = [[150, 110, 60], [110, 80, 45], [200, 160, 100]];
+    for (let i = 0; i < 26; i++) { const a = rnd(-Math.PI, 0), s = rnd(60, 180); this.add(cx, cy, Math.cos(a) * s * 0.6, Math.sin(a) * s, rnd(0.4, 0.8), cols[i % 3], rnd(3, 6), 420); }
+  }
+  emitBurst([cx, cy], color, n) {
+    for (let i = 0; i < n; i++) { const a = rnd(0, Math.PI * 2), s = rnd(40, 160); this.add(cx, cy, Math.cos(a) * s, Math.sin(a) * s, rnd(0.3, 0.7), color, rnd(2, 5), 120); }
+  }
+  emitPortal([cx, cy]) {
+    for (let i = 0; i < 18; i++) { const a = i / 18 * Math.PI * 2; this.add(cx + Math.cos(a) * 18, cy + Math.sin(a) * 18, Math.cos(a + 1.2) * 90, Math.sin(a + 1.2) * 90, 0.5, [140, 170, 255], 3, 0, "circle"); }
+  }
+  emitSparkle([cx, cy]) {
+    const cols = [[250, 220, 80], [240, 240, 245], [255, 180, 80]];
+    for (let i = 0; i < 40; i++) { const a = rnd(0, Math.PI * 2), s = rnd(30, 200); this.add(cx, cy, Math.cos(a) * s, Math.sin(a) * s, rnd(0.6, 1.3), cols[i % 3], rnd(2, 6), 60, "circle"); }
+  }
+  updateParticles(dt) {
+    this.particles = this.particles.filter(p => { p.life -= dt; if (p.life <= 0) return false; p.vy += p.grav * dt; p.x += p.vx * dt; p.y += p.vy * dt; return true; });
+    this.texts = this.texts.filter(t => { t.life -= dt; t.y -= 40 * dt; return t.life > 0; });
+    this.shake = Math.max(0, this.shake - dt);
+  }
+
+  // ---------------- drawing ----------------
+  blit(key, k) { const [x, y] = this.px(k); this.ctx.drawImage(this.img[key], x, y, T, T); }
+  text(font, txt, cx, cy, color = WHITE, align = "center") {
+    const c = this.ctx; c.font = font; c.fillStyle = color; c.textAlign = align; c.textBaseline = "middle"; c.fillText(txt, cx, cy);
+  }
+  drawLevel() {
+    const c = this.ctx, lv = this.level, st = this.state, tnow = now(), sec = tnow / 1000;
+    const red = lv.redOpen(st.crates), green = lv.greenOpen(st.crates);
+    const up = spikesUp(st.moves), warn = lv.spikes.size && spikePhase(st.moves) === 1;
+    const blink = Math.floor(sec * 6) % 2 === 0;
+    for (let y = 0; y < lv.h; y++) for (let x = 0; x < lv.w; x++) {
+      const p = K(x, y);
+      if (lv.walls.has(p)) { this.blit("wall", p); continue; }
+      this.blit("floor", p);
+      if (lv.pits.has(p)) this.blit(st.filled.has(p) ? "pit_filled" : "pit", p);
+      else if (lv.redSwitches.has(p)) this.blit("red_switch", p);
+      else if (lv.greenSwitches.has(p)) this.blit("green_switch", p);
+      else if (lv.goals.has(p)) {
+        const [gx, gy] = this.px(p);
+        c.fillStyle = `rgba(250,220,80,${(60 + 50 * Math.sin(sec * 4)) / 255})`;
+        c.beginPath(); c.roundRect(gx, gy, T, T, 10); c.fill();
+        this.blit("goal", p);
+      }
+      else if (lv.spikes.has(p)) this.blit(up ? "spike_up" : (warn && blink ? "spike_warn" : "spike_down"), p);
+      else if (lv.teleporters.has(p)) {
+        const [cx, cy] = this.center(p);
+        c.save(); c.translate(cx, cy); c.rotate(-(sec * 90 % 360) * Math.PI / 180);
+        c.drawImage(this.img["portal_" + lv.teleId.get(p)], -T / 2, -T / 2, T, T); c.restore();
+      }
+      else if (lv.redDoors.has(p)) this.blit(red ? "red_door_open" : "red_door", p);
+      else if (lv.greenDoors.has(p)) this.blit(green ? "green_door_open" : "green_door", p);
+    }
+    this.ghosts = this.ghosts.filter(([key, a, b, t0, dur]) => {
+      const t = (tnow - t0) / dur; if (t >= 1) return false;
+      const [ax, ay] = this.px(a), [bx, by] = this.px(b);
+      c.drawImage(this.img[key], lerp(ax, bx, t), lerp(ay, by, t), T, T); return true;
+    });
+    for (const [p, ct] of st.crates) {
+      const key = (ct === GREEN && !green) ? "green_inactive" : ct;
+      let [x, y] = this.px(p);
+      if (this.crateAnim.has(p)) {
+        const [a, t0, dur] = this.crateAnim.get(p); const t = (tnow - t0) / dur;
+        if (t >= 1) this.crateAnim.delete(p); else { const [ax, ay] = this.px(a); x = lerp(ax, x, t); y = lerp(ay, y, t); }
+      }
+      c.drawImage(this.img[key], x, y, T, T);
+    }
+    st.hands.forEach((p, i) => {
+      let [x, y] = this.px(p);
+      if (this.handAnim.has(i)) {
+        const [a, t0] = this.handAnim.get(i); const t = (tnow - t0) / ANIM_MS;
+        if (t >= 1) this.handAnim.delete(i); else { const [ax, ay] = this.px(a); x = lerp(ax, x, t); y = lerp(ay, y, t); }
+      }
+      const bob = st.sprites[i] === "hand" ? Math.sin(sec * 3 + i) * 2 : 0;
+      c.drawImage(this.img[st.sprites[i]], x, y + bob, T, T);
+    });
+    for (const p of this.particles) {
+      const a = Math.max(0, Math.min(1, p.life / p.maxLife)), s = Math.max(1, p.size * (0.4 + 0.6 * a));
+      const f = 0.5 + 0.5 * a;
+      c.fillStyle = `rgb(${p.color[0] * f | 0},${p.color[1] * f | 0},${p.color[2] * f | 0})`;
+      if (p.shape === "circle") { c.beginPath(); c.arc(p.x, p.y, s, 0, Math.PI * 2); c.fill(); }
+      else c.fillRect(p.x | 0, p.y | 0, s | 0, s | 0);
+    }
+    for (const t of this.texts) {
+      c.globalAlpha = Math.min(1, t.life / 0.4); this.text("bold 22px sans-serif", t.text, t.x, t.y, t.color); c.globalAlpha = 1;
+    }
+  }
+  drawHud() {
+    const c = this.ctx, lv = this.level, st = this.state;
+    c.fillStyle = HUD_BG; c.fillRect(0, 0, this.W, HUD_H);
+    this.text("bold 20px sans-serif", `Level ${this.levelIndex + 1}/${this.levels.length}: ${lv.name}`, 14, 20, WHITE, "left");
+    this.text("bold 20px sans-serif", `Moves: ${st.moves}   Par: ${lv.par}`, 14, 44, st.moves <= lv.par ? YELLOW : GREY, "left");
+    this.text("15px sans-serif", `Stars: ${this.stars.reduce((a, b) => a + b, 0)}`, this.W - 14, 18, YELLOW, "right");
+    this.text("15px sans-serif", "Arrows/WASD move   Z undo   R restart   Esc title", this.W - 14, 42, GREY, "right");
+    this.text("15px sans-serif", lv.hint, this.W / 2, this.H - 22, "#bebecd");
+  }
+  drawStars(n, cx, cy, size = 40) {
+    const c = this.ctx;
+    for (let k = 0; k < 3; k++) {
+      const x = cx + (k - 1) * (size + 14);
+      c.fillStyle = k < n ? YELLOW : "#464655"; c.beginPath();
+      for (let j = 0; j < 10; j++) { const r = j % 2 === 0 ? size / 2 : size / 5, a = -Math.PI / 2 + j * Math.PI / 5; c.lineTo(x + Math.cos(a) * r, cy + Math.sin(a) * r); }
+      c.closePath(); c.fill();
+    }
+  }
+  overlay(alpha) { this.ctx.fillStyle = `rgba(0,0,0,${alpha / 255})`; this.ctx.fillRect(0, 0, this.W, this.H); }
+  drawTitle() {
+    const c = this.ctx, sec = now() / 1000;
+    c.fillStyle = BG; c.fillRect(0, 0, this.W, this.H);
+    c.globalAlpha = 0.25;
+    this.seedSprites.forEach((s, k) => { const x = (s.x + sec * s.sp) % (this.W + T) - T; c.drawImage(this.img[s.key], x, s.y + Math.sin(sec + k) * 8, T, T); });
+    c.globalAlpha = 1;
+    this.text("bold 56px sans-serif", "HELPING HAND", this.W / 2, this.H * 0.28, YELLOW);
+    this.text("20px sans-serif", "A push-the-crates puzzle", this.W / 2, this.H * 0.28 + 50, GREY);
+    const lines = [
+      "Arrow keys / WASD: move every hand      Z: undo      R: restart level",
+      "Push crates into pits to fill them.  Crates on switches open matching doors.",
+      "Sliding crates keep going.  Green crates are ghosts until a green switch is pressed.",
+      "Spikes rise every 2 moves.  Portals swap you (or a crate) to their twin.",
+      "Fewer moves = more stars.  Every hand must reach a goal.",
+    ];
+    lines.forEach((l, i) => this.text("15px sans-serif", l, this.W / 2, this.H * 0.52 + i * 24, "#c8c8d7"));
+    if (Math.floor(sec * 2) % 2 === 0) this.text("bold 22px sans-serif", "Press ENTER to start", this.W / 2, this.H * 0.86, WHITE);
+  }
+  drawResults() {
+    const c = this.ctx;
+    c.fillStyle = BG; c.fillRect(0, 0, this.W, this.H);
+    this.text("bold 56px sans-serif", "YOU WIN!", this.W / 2, this.H * 0.2, YELLOW);
+    const total = this.stars.reduce((a, b) => a + b, 0);
+    this.text("bold 22px sans-serif", `Total stars: ${total} / ${3 * this.levels.length}`, this.W / 2, this.H * 0.32, WHITE);
+    this.stars.forEach((s, i) => {
+      const y = this.H * 0.42 + i * 34;
+      this.text("15px sans-serif", `${i + 1}. ${this.levels[i].name}`, this.W / 2 - 160, y, "#c8c8d7");
+      this.drawStars(s, this.W / 2 + 120, y, 22);
+    });
+    this.text("20px sans-serif", "Press any key to return to the title", this.W / 2, this.H * 0.92, GREY);
+  }
+  loop() {
+    const t = now(), dt = Math.min(0.1, (t - this.last) / 1000); this.last = t;
+    if (this.ready) {
+      this.updateParticles(dt);
+      const c = this.ctx;
+      if (this.scene === "title") this.drawTitle();
+      else if (this.scene === "results") this.drawResults();
+      else {
+        c.save();
+        if (this.shake > 0) c.translate(rnd(-4, 4), rnd(-4, 4));
+        c.fillStyle = BG; c.fillRect(-10, -10, this.W + 20, this.H + 20);
+        this.drawLevel(); this.drawHud();
+        c.restore();
+        if (this.state.dead) {
+          this.overlay(120);
+          this.text("bold 56px sans-serif", "OUCH!", this.W / 2, this.H / 2 - 20, RED);
+          this.text("bold 22px sans-serif", "Z to undo   R to restart", this.W / 2, this.H / 2 + 30, WHITE);
+        } else if (this.scene === "clear") {
+          this.overlay(150);
+          this.text("bold 56px sans-serif", "LEVEL CLEAR", this.W / 2, this.H / 2 - 70, YELLOW);
+          this.drawStars(this.earned, this.W / 2, this.H / 2);
+          this.text("bold 22px sans-serif", `${this.state.moves} moves  (par ${this.level.par})`, this.W / 2, this.H / 2 + 50, WHITE);
+          if (t - this.clearTime > 600) this.text("15px sans-serif", "Press any key to continue", this.W / 2, this.H / 2 + 90, GREY);
+        }
+      }
+    }
+    requestAnimationFrame(() => this.loop());
+  }
+}
+const game = new Game(document.getElementById("game"));
+window.game = game;
+</script>
+</body>
+</html>
