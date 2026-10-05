@@ -1,0 +1,1052 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dino Infinite Runner</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fafafa;
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Courier New", monospace; overflow: hidden;
+    user-select: none; touch-action: none; }
+  #stage { position: relative; border-radius: 6px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.12); line-height: 0; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges;
+    cursor: pointer; }
+  /* Night veil: dark blue overlay, fades in/out on top of everything */
+  #nightVeil {
+    position: absolute; inset: 0;
+    border-radius: 6px;
+    background: #0a1535;
+    opacity: 0;
+    transition: opacity 1.2s ease;
+    pointer-events: none;
+  }
+  /* Controls hint as real text so it stays crisp at any canvas scale.
+     Sits under #nightVeil in the DOM so night still darkens it. */
+  #hint {
+    position: absolute;
+    left: calc(30 / 1366 * 100%);
+    top: 6%;
+    transform: translateY(-50%);
+    line-height: 1;
+    font-family: "Courier New", Courier, monospace;
+    color: #808080;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  #loading { position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; background: #fafafa; color: #535353;
+    font-size: 18px; letter-spacing: 2px; z-index: 10;
+    transition: opacity .5s ease-out; }
+</style>
+</head>
+<body>
+<div id="loading">Loading sprites…</div>
+<div id="stage">
+  <canvas id="game"></canvas>
+  <div id="hint">You can double jump.</div>
+  <div id="nightVeil"></div>
+</div>
+
+<script>
+/* ============================================================
+   DINO INFINITE RUNNER, v11
+   ============================================================ */
+
+const ROOM_W = 1366, ROOM_H = 768;
+const GROUND_Y = 600, SPAWN_X = 1400;
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+canvas.width = ROOM_W; canvas.height = ROOM_H;
+ctx.imageSmoothingEnabled = false;
+ctx.fillStyle = '#f7f7f7';
+ctx.fillRect(0, 0, ROOM_W, ROOM_H);
+
+const nightVeil = document.getElementById('nightVeil');
+const hintEl = document.getElementById('hint');
+const HINT_FONT_PX = 22;   // size in room pixels, scaled with the canvas
+let hintColor = '#808080'; // cached so the DOM is only touched when the color changes
+
+function fitCanvas() {
+  const s = Math.min(window.innerWidth / ROOM_W, window.innerHeight / ROOM_H) * 0.96;
+  const w = (ROOM_W * s) + 'px';
+  const h = (ROOM_H * s) + 'px';
+  document.getElementById('stage').style.width  = w;
+  document.getElementById('stage').style.height = h;
+  canvas.style.width  = w;
+  canvas.style.height = h;
+  hintEl.style.fontSize = (HINT_FONT_PX * s) + 'px';
+}
+window.addEventListener('resize', fitCanvas); fitCanvas();
+
+/* --- Raster sprite loading --- */
+const SPRITE_DIR = 'assets/';
+const SPRITE_DEFS = {
+  spr_dino_run:  { file: 'dino-run.png',     frames: 2 },
+  spr_dino_duck: { file: 'dino-duck.png',    frames: 2 },
+  spr_dino_jump: { file: 'dino-jump.png',    frames: 1 },
+  spr_dino_dead: { file: 'dino-dead.png',    frames: 1 },
+  spr_cactus_l:  { file: 'cactus-large.png', frames: 1 },
+  spr_cactus_s:  { file: 'cactus-small.png', frames: 3 },
+  spr_bird:      { file: 'bird.png',         frames: 2 },
+  spr_gameover:  { file: 'game-over.png',    frames: 1 },
+  spr_replay:    { file: 'replay.png',       frames: 1 },
+  spr_ground1:   { file: 'ground1.png',      frames: 1 },
+};
+const SPR = {};
+
+function loadImage(src) {
+  return new Promise((res, rej) => { const img = new Image();
+    img.onload = () => res(img); img.onerror = () => rej(new Error('load ' + src)); img.src = src; });
+}
+
+function buildSprite(img, n) {
+  const fw = Math.floor(img.width / n), fh = img.height;
+  const frames = [], masks = [];
+  for (let i = 0; i < n; i++) {
+    const c = document.createElement('canvas'); c.width = fw; c.height = fh;
+    const cx = c.getContext('2d');
+    cx.drawImage(img, i * fw, 0, fw, fh, 0, 0, fw, fh);
+    const data = cx.getImageData(0, 0, fw, fh).data;
+    const m = new Uint8Array(fw * fh);
+    for (let p = 0; p < fw * fh; p++) m[p] = data[p * 4 + 3] > 0 ? 1 : 0;
+    frames.push(c); masks.push(m);
+  }
+  return { frames, masks, w: fw, h: fh, n };
+}
+
+function buildFromCanvas(c) {
+  const cx = c.getContext('2d');
+  const data = cx.getImageData(0, 0, c.width, c.height).data;
+  const m = new Uint8Array(c.width * c.height);
+  for (let p = 0; p < c.width * c.height; p++) m[p] = data[p * 4 + 3] > 0 ? 1 : 0;
+  return { frames: [c], masks: [m], w: c.width, h: c.height, n: 1 };
+}
+
+function washSprite(spr, color) {
+  if (!color) return spr;
+  const frames = spr.frames.map(f => {
+    const c = document.createElement('canvas');
+    c.width = f.width; c.height = f.height;
+    const cx = c.getContext('2d');
+    cx.drawImage(f, 0, 0);
+    cx.globalCompositeOperation = 'source-atop';
+    cx.fillStyle = color;
+    cx.fillRect(0, 0, c.width, c.height);
+    cx.globalCompositeOperation = 'source-over';
+    return c;
+  });
+  return { frames, masks: spr.masks, w: spr.w, h: spr.h, n: spr.n };
+}
+
+/* --- Procedural obstacle sprites --- */
+function buildBlockSprite() {
+  const c = document.createElement('canvas'); c.width = 200; c.height = 30;
+  const x = c.getContext('2d');
+  x.fillStyle = '#fff';    x.fillRect(0, 0, 200, 30);
+  x.fillStyle = '#9a9a9a'; x.fillRect(5, 5, 190, 20);
+  return buildFromCanvas(c);
+}
+function buildTree() {
+  const c = document.createElement('canvas'); c.width = 90; c.height = 130;
+  const x = c.getContext('2d');
+  x.fillStyle = '#6b4a2b'; x.fillRect(40, 80, 14, 50);
+  x.fillStyle = '#4f3520'; x.fillRect(50, 80, 4, 50);
+  x.fillStyle = '#2d7d3a';
+  x.beginPath(); x.arc(45, 50, 38, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(18, 72, 24, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(72, 72, 24, 0, Math.PI*2); x.fill();
+  x.fillStyle = '#3fa04e';
+  x.beginPath(); x.arc(40, 38, 24, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(26, 60, 15, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(60, 60, 15, 0, Math.PI*2); x.fill();
+  return buildFromCanvas(c);
+}
+function buildBush() {
+  const c = document.createElement('canvas'); c.width = 70; c.height = 55;
+  const x = c.getContext('2d');
+  x.fillStyle = '#2d7d3a';
+  x.beginPath(); x.arc(20, 35, 20, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(50, 35, 20, 0, Math.PI*2); x.fill();
+  x.fillStyle = '#3fa04e';
+  x.beginPath(); x.arc(35, 24, 22, 0, Math.PI*2); x.fill();
+  return buildFromCanvas(c);
+}
+function buildCoral() {
+  const c = document.createElement('canvas'); c.width = 85; c.height = 120;
+  const x = c.getContext('2d');
+  x.fillStyle = '#d95f70';
+  x.fillRect(38, 55, 12, 65);
+  x.fillRect(16, 35, 8, 65);
+  x.fillRect(60, 25, 8, 75);
+  x.fillRect(26, 8, 8, 55);
+  x.beginPath(); x.arc(20, 35, 8, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(64, 25, 8, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(30, 8, 8, 0, Math.PI*2); x.fill();
+  x.fillStyle = '#ee7f90';
+  x.fillRect(40, 55, 4, 65);
+  x.fillRect(18, 35, 3, 65);
+  x.fillRect(62, 25, 3, 75);
+  return buildFromCanvas(c);
+}
+function buildSeaweed() {
+  const c = document.createElement('canvas'); c.width = 65; c.height = 95;
+  const x = c.getContext('2d');
+  x.strokeStyle = '#3fae7a'; x.lineWidth = 8; x.lineCap = 'round';
+  x.beginPath();
+  x.moveTo(20, 95);
+  x.bezierCurveTo(8, 65, 30, 45, 20, 22);
+  x.bezierCurveTo(14, 10, 26, 4, 22, 0);
+  x.stroke();
+  x.beginPath();
+  x.moveTo(44, 95);
+  x.bezierCurveTo(56, 65, 34, 45, 44, 22);
+  x.bezierCurveTo(52, 10, 38, 4, 42, 0);
+  x.stroke();
+  return buildFromCanvas(c);
+}
+function buildFish() {
+  const c = document.createElement('canvas'); c.width = 92; c.height = 55;
+  const x = c.getContext('2d');
+  x.fillStyle = '#f0a830';
+  x.beginPath(); x.ellipse(40, 28, 28, 16, 0, 0, Math.PI*2); x.fill();
+  x.beginPath();
+  x.moveTo(65, 28); x.lineTo(90, 12); x.lineTo(84, 28); x.lineTo(90, 44);
+  x.closePath(); x.fill();
+  x.beginPath();
+  x.moveTo(35, 14); x.lineTo(48, 6); x.lineTo(50, 15);
+  x.closePath(); x.fill();
+  x.fillStyle = '#d08a20'; x.fillRect(40, 26, 20, 4);
+  x.fillStyle = '#1a1a1a';
+  x.beginPath(); x.arc(22, 26, 3, 0, Math.PI*2); x.fill();
+  return buildFromCanvas(c);
+}
+function buildBee() {
+  const c = document.createElement('canvas'); c.width = 70; c.height = 55;
+  const x = c.getContext('2d');
+  x.fillStyle = 'rgba(210, 230, 255, 0.75)';
+  x.beginPath(); x.ellipse(28, 14, 14, 9, -0.2, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.ellipse(42, 14, 12, 8, 0.2, 0, Math.PI*2); x.fill();
+  x.fillStyle = '#f0c030';
+  x.beginPath(); x.ellipse(32, 32, 22, 14, 0, 0, Math.PI*2); x.fill();
+  x.fillStyle = '#1a1a1a';
+  x.fillRect(22, 20, 4, 24);
+  x.fillRect(32, 19, 4, 26);
+  x.fillRect(42, 20, 4, 24);
+  x.fillStyle = '#f0c030';
+  x.beginPath(); x.arc(12, 30, 9, 0, Math.PI*2); x.fill();
+  x.fillStyle = '#1a1a1a';
+  x.beginPath(); x.arc(10, 28, 2.5, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.moveTo(52, 32); x.lineTo(64, 34); x.lineTo(52, 36); x.closePath(); x.fill();
+  return buildFromCanvas(c);
+}
+function buildBat() {
+  const c = document.createElement('canvas'); c.width = 80; c.height = 50;
+  const x = c.getContext('2d');
+  x.fillStyle = '#3a3a3a';
+  x.beginPath(); x.ellipse(40, 26, 14, 12, 0, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(40, 14, 9, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.moveTo(34, 8); x.lineTo(32, 0); x.lineTo(38, 6); x.closePath(); x.fill();
+  x.beginPath(); x.moveTo(46, 8); x.lineTo(48, 0); x.lineTo(42, 6); x.closePath(); x.fill();
+  x.beginPath();
+  x.moveTo(28, 22); x.quadraticCurveTo(10, 15, 0, 30);
+  x.quadraticCurveTo(15, 30, 28, 34); x.closePath(); x.fill();
+  x.beginPath();
+  x.moveTo(52, 22); x.quadraticCurveTo(70, 15, 80, 30);
+  x.quadraticCurveTo(65, 30, 52, 34); x.closePath(); x.fill();
+  x.fillStyle = '#ffcc00';
+  x.beginPath(); x.arc(37, 14, 2, 0, Math.PI*2); x.fill();
+  x.beginPath(); x.arc(43, 14, 2, 0, Math.PI*2); x.fill();
+  return buildFromCanvas(c);
+}
+function buildPillar() {
+  const c = document.createElement('canvas'); c.width = 70; c.height = 120;
+  const x = c.getContext('2d');
+  x.fillStyle = '#8a8a8a'; x.fillRect(12, 0, 46, 120);
+  x.fillStyle = '#a5a5a5'; x.fillRect(18, 0, 12, 120);
+  x.fillStyle = '#6a6a6a'; x.fillRect(48, 0, 10, 120);
+  x.fillStyle = '#b5b5b5'; x.fillRect(12, 0, 46, 10);
+  x.fillStyle = '#5a5a5a'; x.fillRect(32, 42, 3, 22); x.fillRect(35, 58, 5, 16);
+  return buildFromCanvas(c);
+}
+function buildRock() {
+  const c = document.createElement('canvas'); c.width = 70; c.height = 55;
+  const x = c.getContext('2d');
+  x.fillStyle = '#8a8a8a';
+  x.beginPath();
+  x.moveTo(0, 55); x.lineTo(10, 18); x.lineTo(30, 6);
+  x.lineTo(55, 14); x.lineTo(70, 55); x.closePath(); x.fill();
+  x.fillStyle = '#a5a5a5';
+  x.beginPath();
+  x.moveTo(10, 52); x.lineTo(18, 24); x.lineTo(30, 14);
+  x.lineTo(38, 52); x.closePath(); x.fill();
+  x.fillStyle = '#5a5a5a'; x.fillRect(45, 28, 3, 16);
+  return buildFromCanvas(c);
+}
+
+/* --- Biome config --- */
+const BG_COLORS = {
+  desert: [250, 240, 218],
+  forest: [212, 236, 212],
+  ocean:  [196, 224, 242],
+  stone:  [230, 222, 208],
+};
+const BLOCK_TINTS = {
+  desert: null,
+  forest: 'rgba(60, 120, 60, 0.4)',
+  ocean:  'rgba(40, 100, 160, 0.45)',
+  stone:  'rgba(60, 60, 60, 0.4)',
+};
+const GROUND_TINTS = {
+  desert: null,
+  forest: 'rgba(80, 130, 80, 0.32)',
+  ocean:  'rgba(60, 120, 170, 0.38)',
+  stone:  'rgba(80, 80, 80, 0.28)',
+};
+
+const BIOME_OBSTACLES = {
+  desert: { large: 'spr_cactus_l', small: 'spr_cactus_s', flyer: 'spr_bird' },
+  forest: { large: 'spr_tree_l',   small: 'spr_bush_s',   flyer: 'spr_bee' },
+  ocean:  { large: 'spr_coral_l',  small: 'spr_seaweed_s',flyer: 'spr_fish' },
+  stone:  { large: 'spr_pillar_l', small: 'spr_rock_s',   flyer: 'spr_bat' },
+};
+
+const BIOME_WEATHER = {
+  desert: ['sandstorm', 'meteor'],
+  forest: ['rain', 'snow'],
+  ocean:  ['bubbles'],
+  stone:  ['rain', 'sandstorm', 'meteor'],
+};
+
+/* --- Tuning --- */
+const ANIM_STEPS = 10;
+const GRAVITY = 0.6;
+const JUMP_V = 15, JUMP_V2 = 14;
+const FAST_FALL_EXTRA_G = 1.2;
+
+const BLOCK_TOPS = [GROUND_Y - 110, GROUND_Y - 190, GROUND_Y - 270];
+const FLYER_LOW_Y = GROUND_Y - 75;
+const FLYER_MID_Y = GROUND_Y - 130;
+
+const GATE_LARGE   = 200;
+const GATE_FLYER   = 450;
+const GATE_BLOCK   = 800;
+const GATE_WEATHER = 1200;
+
+/* Day/night lengths in steps (60 steps = 1 second). Same 120 s cycle as before,
+   split 90 s day / 30 s night instead of 60 / 60. */
+const DAY_STEPS   = 60 * 90;
+const NIGHT_STEPS = 60 * 30;
+
+/* Weather changes how the run feels. Missing types play normally.
+   grav multiplies GRAVITY, speed multiplies world scroll speed. */
+const WEATHER_FX = {
+  snow:    { grav: 0.80, speed: 1.00 },   // floatier, higher jumps
+  bubbles: { grav: 0.75, speed: 1.00 },   // underwater drift
+  rain:    { grav: 1.00, speed: 1.10 },   // slick ground, world runs faster
+};
+const FX_EASE = 0.02;   // per-step easing toward the target, about 95% in 2.5 s
+
+/* Score milestones */
+const MILESTONE = 100;
+const FLASH_STEPS = 48, FLASH_PHASE = 8;   // 3 blinks over 0.8 s
+
+const SPEED_START = 5.5;
+const SPEED_MAX   = 12;
+const SPEED_ACCEL = 0.0007;
+const SCORE_ALARM = 2;
+
+const ALL_BIOMES = ['desert', 'forest', 'ocean', 'stone'];
+
+/* Slower biome rotation */
+const BIOME_MIN_SCORE = 700, BIOME_MAX_SCORE = 1300;
+const BLEND_PER_STEP = 1 / 180;    // 3 second cross-fade, gentler
+const WEATHER_CHANCE = 0.008;
+const WEATHER_STEPS_MIN = 300, WEATHER_STEPS_MAX = 600;
+
+const SPAWN_MARGIN = 40;
+const MIN_GAP_BASE = 350;
+const MIN_GAP_PER_SPEED = 35;
+
+/* --- Helpers --- */
+const choose = (...a) => a[Math.floor(Math.random() * a.length)];
+const irandom_range = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+function pad(n, len = 5) { return String(Math.floor(n)).padStart(len, '0'); }
+function shuffle(a) {
+  a = a.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function pixelCollide(ax, ay, as, af, bx, by, bs, bf) {
+  ax = Math.round(ax); ay = Math.round(ay); bx = Math.round(bx); by = Math.round(by);
+  const x0 = Math.max(ax, bx), x1 = Math.min(ax + as.w, bx + bs.w);
+  const y0 = Math.max(ay, by), y1 = Math.min(ay + as.h, by + bs.h);
+  if (x0 >= x1 || y0 >= y1) return false;
+  const am = as.masks[af], bm = bs.masks[bf];
+  for (let y = y0; y < y1; y++) {
+    const ar = (y - ay) * as.w - ax, br = (y - by) * bs.w - bx;
+    for (let x = x0; x < x1; x++) if (am[ar + x] && bm[br + x]) return true;
+  }
+  return false;
+}
+function rectOverlapsAny(r, margin) {
+  for (const o of obstacles) {
+    const s = SPR[o.sprite];
+    if (r.x < o.x + s.w + margin && r.x + r.w + margin > o.x &&
+        r.y < o.y + s.h + margin && r.y + r.h + margin > o.y) return true;
+  }
+  for (const b of blocks) {
+    if (r.x < b.x + b.w + margin && r.x + r.w + margin > b.x &&
+        r.y < b.y + b.h + margin && r.y + r.h + margin > b.y) return true;
+  }
+  return false;
+}
+function rightmostObstacleEdge() {
+  let maxX = -Infinity;
+  for (const o of obstacles) {
+    const r = o.x + SPR[o.sprite].w;
+    if (r > maxX) maxX = r;
+  }
+  return maxX === -Infinity ? -Infinity : maxX;
+}
+function minObstacleGap() {
+  return Math.round(MIN_GAP_BASE + ctrl.speed * MIN_GAP_PER_SPEED);
+}
+
+/* --- High score --- */
+let highscore = 0;
+try { highscore = Number(localStorage.getItem('dinoRunnerHigh')) || 0; } catch (e) {}
+function saveHigh() { try { localStorage.setItem('dinoRunnerHigh', String(highscore)); } catch (e) {} }
+
+/* --- Load --- */
+async function loadAllSprites() {
+  await Promise.all(Object.keys(SPRITE_DEFS).map(async (name) => {
+    const d = SPRITE_DEFS[name];
+    SPR[name] = buildSprite(await loadImage(SPRITE_DIR + d.file), d.frames);
+  }));
+
+  SPR.spr_block     = buildBlockSprite();
+  SPR.spr_tree_l    = buildTree();
+  SPR.spr_bush_s    = buildBush();
+  SPR.spr_coral_l   = buildCoral();
+  SPR.spr_seaweed_s = buildSeaweed();
+  SPR.spr_fish      = buildFish();
+  SPR.spr_bee       = buildBee();
+  SPR.spr_bat       = buildBat();
+  SPR.spr_pillar_l  = buildPillar();
+  SPR.spr_rock_s    = buildRock();
+
+  for (const b of ALL_BIOMES) {
+    SPR['spr_block_' + b]   = washSprite(SPR.spr_block,   BLOCK_TINTS[b]);
+    SPR['spr_ground1_' + b] = washSprite(SPR.spr_ground1, GROUND_TINTS[b]);
+  }
+
+  // Center the hint on the score row (replay icon top is y = 24)
+  hintEl.style.top = ((24 + SPR.spr_replay.h / 2) / ROOM_H * 100) + '%';
+
+  const loading = document.getElementById('loading');
+  loading.style.opacity = '0';
+  setTimeout(() => { loading.style.display = 'none'; }, 520);
+}
+
+/* --- Room state --- */
+let ctrl, dino, obstacles, blocks, weather;
+let biomePrev, biomeCur, biomeBlend;
+let nightShown = false;
+let biomeQueue = [], nextBiomeScore = 0, lastBiome = null;
+let pendingObstacle = null;
+
+function popNextBiome() {
+  if (biomeQueue.length === 0) {
+    biomeQueue = shuffle(ALL_BIOMES);
+    if (biomeQueue.length > 1 && biomeQueue[biomeQueue.length - 1] === lastBiome) {
+      [biomeQueue[0], biomeQueue[biomeQueue.length - 1]] =
+      [biomeQueue[biomeQueue.length - 1], biomeQueue[0]];
+    }
+  }
+  lastBiome = biomeQueue.pop();
+  return lastBiome;
+}
+function rollNextBiomeScore() {
+  return ctrl.score + irandom_range(BIOME_MIN_SCORE, BIOME_MAX_SCORE);
+}
+
+function room_start() {
+  ctrl = { alarm: [90, 300, SCORE_ALARM], score: 0, speed: SPEED_START, steps: 0,
+    bgOffset: 0, dayTimer: 0, night: false, deathTimer: 0,
+    fxGrav: 1, fxSpeed: 1, flashTimer: 0,
+    clouds: [{x:900,y:150},{x:480,y:230},{x:1300,y:190}] };
+  dino = { x: 150, y: GROUND_Y - 94, vspeed: 0, sprite: 'spr_dino_run',
+    image_index: 0, animTimer: 0, dead: false, jumpsUsed: 0 };
+  obstacles = []; blocks = [];
+  pendingObstacle = null;
+
+  biomeQueue = shuffle(ALL_BIOMES);
+  lastBiome = null;
+  const first = biomeQueue.pop();
+  lastBiome = first;
+  biomePrev = first;
+  biomeCur  = first;
+  biomeBlend = 1;
+  nextBiomeScore = irandom_range(BIOME_MIN_SCORE, BIOME_MAX_SCORE);
+
+  weather = { type: null, timer: 0, particles: [], draining: false };
+
+  input.jumpPressed = false;
+  nightShown = false;
+  nightVeil.style.opacity = '0';
+}
+function room_restart() { room_start(); }
+
+/* --- Sound (generated with Web Audio, no files needed) --- */
+let audioCtx = null;
+function ensureAudio() {
+  // Browsers only allow audio after a user gesture, so this runs from input handlers
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch (e) { audioCtx = null; }
+}
+function beep(freq, dur, opts = {}) {
+  if (!audioCtx || audioCtx.state !== 'running') return;
+  const t0 = audioCtx.currentTime + (opts.delay || 0);
+  const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+  osc.type = opts.type || 'square';
+  osc.frequency.setValueAtTime(freq, t0);
+  if (opts.toFreq) osc.frequency.exponentialRampToValueAtTime(opts.toFreq, t0 + dur);
+  gain.gain.setValueAtTime(opts.vol || 0.05, t0);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t0); osc.stop(t0 + dur + 0.02);
+}
+const sfx = {
+  jump:       () => beep(520, 0.09, { toFreq: 780 }),
+  doubleJump: () => beep(780, 0.09, { toFreq: 1100 }),
+  milestone:  () => { beep(880, 0.07); beep(1320, 0.09, { delay: 0.08 }); },
+  death:      () => beep(300, 0.30, { toFreq: 80, type: 'sawtooth', vol: 0.06 }),
+};
+
+/* --- Input --- */
+const input = { jumpPressed: false, jumpHeld: false, down: false };
+const JUMP_KEYS = ['Space', 'ArrowUp', 'KeyW'];
+const DUCK_KEYS = ['ArrowDown', 'KeyS'];
+
+window.addEventListener('keydown', (e) => {
+  ensureAudio();
+  if (JUMP_KEYS.includes(e.code)) {
+    e.preventDefault();
+    if (dino && dino.dead) { if (ctrl.deathTimer > 20 && !e.repeat) room_restart(); return; }
+    if (!e.repeat) input.jumpPressed = true;
+    input.jumpHeld = true;
+  }
+  if (DUCK_KEYS.includes(e.code)) { e.preventDefault(); input.down = true; }
+  if (e.code === 'KeyR') room_restart();
+});
+window.addEventListener('keyup', (e) => {
+  if (JUMP_KEYS.includes(e.code)) input.jumpHeld = false;
+  if (DUCK_KEYS.includes(e.code)) input.down = false;
+});
+window.addEventListener('blur', () => { input.jumpHeld = false; input.down = false; });
+
+function pointerPos(e) {
+  const r = canvas.getBoundingClientRect();
+  const t = e.touches ? e.touches[0] : e;
+  return { x: (t.clientX - r.left) / r.width * ROOM_W, y: (t.clientY - r.top) / r.height * ROOM_H };
+}
+function replayBounds() { const s = SPR.spr_replay; return { x: ROOM_W - s.w - 24, y: 24, w: s.w, h: s.h }; }
+
+function onPress(e) {
+  e.preventDefault(); ensureAudio(); if (!ctrl) return;
+  const p = pointerPos(e), rb = replayBounds();
+  if (p.x >= rb.x && p.x <= rb.x + rb.w && p.y >= rb.y && p.y <= rb.y + rb.h) { room_restart(); return; }
+  if (dino.dead) { if (ctrl.deathTimer > 20) room_restart(); return; }
+  input.jumpPressed = true; input.jumpHeld = true;
+}
+function onRelease() { input.jumpHeld = false; }
+canvas.addEventListener('mousedown', onPress);
+window.addEventListener('mouseup', onRelease);
+canvas.addEventListener('touchstart', onPress, { passive: false });
+window.addEventListener('touchend', onRelease);
+
+/* --- Biome transition --- */
+function updateBiome() {
+  if (ctrl.score >= nextBiomeScore) {
+    biomePrev = biomeCur;
+    biomeCur = popNextBiome();
+    biomeBlend = 0;
+    nextBiomeScore = rollNextBiomeScore();
+    if (weather.type === 'meteor') {
+      startMeteorDrain();
+    } else {
+      weather.type = null;
+      weather.particles = [];
+    }
+    weather.timer = irandom_range(120, 360);
+  }
+  if (biomeBlend < 1) biomeBlend = Math.min(1, biomeBlend + BLEND_PER_STEP);
+}
+
+/* --- Weather --- */
+const meteorHalo = (p) => p.size * 1.55;
+const biomeHasMeteors = (b) => (BIOME_WEATHER[b] || []).includes('meteor');
+
+/* Meteors cross the screen far slower than a weather spell lasts, so ending
+   the spell by wiping particles made them vanish mid-screen. Instead: drop the
+   ones not yet visible, stop recycling, and let the visible ones exit left. */
+function startMeteorDrain() {
+  weather.draining = true;
+  weather.particles = weather.particles.filter(p => p.x - meteorHalo(p) < ROOM_W);
+}
+
+function updateWeather() {
+  const w = weather;
+  w.timer--;
+  if (w.timer <= 0 && !w.draining) {
+    if (w.type === 'meteor') {
+      startMeteorDrain();
+    } else if (ctrl.score >= GATE_WEATHER && Math.random() < WEATHER_CHANCE) {
+      const options = BIOME_WEATHER[biomeCur] || ['rain'];
+      w.type = choose(...options);
+      w.timer = irandom_range(WEATHER_STEPS_MIN, WEATHER_STEPS_MAX);
+      w.particles = [];
+      w.draining = false;
+      const counts = { rain: 80, snow: 60, sandstorm: 100, meteor: 3, bubbles: 50 };
+      const n = counts[w.type] || 40;
+      for (let i = 0; i < n; i++) {
+        const p = newParticle(w.type);
+        // Stagger initial x for meteors so they don't enter all at once
+        if (w.type === 'meteor') {
+          p.x = ROOM_W + 200 + i * 500 + Math.random() * 200;
+        }
+        w.particles.push(p);
+      }
+    } else {
+      w.type = null;
+      w.particles = [];
+      // Short cooldown before the next weather roll, instead of re-rolling every frame
+      w.timer = irandom_range(60, 180);
+    }
+  }
+
+  const sp = dino.dead ? 0 : ctrl.speed * ctrl.fxSpeed;
+  for (let i = w.particles.length - 1; i >= 0; i--) {
+    const p = w.particles[i];
+
+    if (w.type === 'meteor') {
+      p.x -= sp * 0.1 + p.vx;
+      p.y += p.vy;
+      // Fully off the left side: recycle during the spell, remove while draining
+      if (p.x + meteorHalo(p) < -50) {
+        if (w.draining) w.particles.splice(i, 1);
+        else w.particles[i] = newParticle('meteor');
+      }
+      continue;
+    }
+
+    if (w.type === 'rain')           { p.x -= sp * 1.5 + p.vx; p.y += p.vy; }
+    else if (w.type === 'snow')      { p.x -= sp * 0.5; p.y += p.vy; p.x += Math.sin(p.y * 0.02) * 0.5; }
+    else if (w.type === 'sandstorm') { p.x -= sp * 2 + p.vx; p.y += Math.sin(p.y * 0.01) * 0.5; }
+    else if (w.type === 'bubbles')   { p.x -= sp * 0.3; p.y -= p.vy; p.x += Math.sin(p.y * 0.03) * 0.3; }
+
+    if (p.x < -60) { p.x = ROOM_W + 60; p.y = Math.random() * ROOM_H; }
+    if (w.type === 'bubbles') {
+      if (p.y < -60) { p.y = ROOM_H + 60; p.x = Math.random() * ROOM_W; }
+    } else {
+      if (p.y > ROOM_H + 60) { p.y = -60; p.x = Math.random() * ROOM_W; }
+      if (p.y < -60)         { p.y = ROOM_H + 60; }
+    }
+  }
+
+  if (w.draining) {
+    // In a biome without meteors they fade out with the biome blend instead
+    if (!biomeHasMeteors(biomeCur) && biomeBlend >= 1) w.particles = [];
+    if (w.particles.length === 0) {
+      w.type = null;
+      w.draining = false;
+      w.timer = irandom_range(60, 180);
+    }
+  }
+}
+
+function newParticle(type) {
+  if (type === 'rain')      return { x: Math.random() * ROOM_W, y: Math.random() * ROOM_H, vy: 8 + Math.random() * 4, vx: 2 };
+  if (type === 'snow')      return { x: Math.random() * ROOM_W, y: Math.random() * ROOM_H, vy: 1 + Math.random() * 2, size: 1 + Math.random() * 3 };
+  if (type === 'sandstorm') return { x: Math.random() * ROOM_W, y: Math.random() * ROOM_H, vy: (Math.random() - 0.5) * 2, vx: 4 + Math.random() * 6 };
+  if (type === 'meteor')    return {
+    // Spawn well off the right edge so the halo never pokes into view early.
+    x: ROOM_W + 200 + Math.random() * 400,
+    y: 60 + Math.random() * 240,
+    vx: 0.4 + Math.random() * 0.5,
+    vy: 0.08 + Math.random() * 0.15,
+    size: 45 + Math.random() * 45,
+    seed: Math.random() * 1000,
+  };
+  if (type === 'bubbles')   return { x: Math.random() * ROOM_W, y: ROOM_H + Math.random() * 120, vy: 1 + Math.random() * 2, size: 2 + Math.random() * 5 };
+}
+
+/* --- Controller alarms --- */
+function obstacleInterval() {
+  const lo = Math.max(55, Math.round(700 / ctrl.speed));
+  const hi = Math.max(90, Math.round(1200 / ctrl.speed));
+  return irandom_range(lo, hi);
+}
+function blockInterval() {
+  const lo = Math.max(180, Math.round(2000 / ctrl.speed));
+  const hi = Math.max(260, Math.round(3200 / ctrl.speed));
+  return irandom_range(lo, hi);
+}
+
+function makeObstacle(spriteName, y, isFlyer) {
+  const o = { sprite: spriteName, x: SPAWN_X, y, image_index: 0, animTimer: 0, isFlyer: !!isFlyer };
+  if (spriteName === 'spr_cactus_s') o.image_index = choose(0, 1, 2);
+  obstacles.push(o);
+}
+
+function trySpawnObstacle(spriteName, y, isFlyer) {
+  const s = SPR[spriteName];
+  const r = { x: SPAWN_X, y, w: s.w, h: s.h };
+
+  if (rectOverlapsAny(r, SPAWN_MARGIN)) {
+    pendingObstacle = { spriteName, y, isFlyer };
+    return false;
+  }
+  const edge = rightmostObstacleEdge();
+  if (edge !== -Infinity && SPAWN_X - edge < minObstacleGap()) {
+    pendingObstacle = { spriteName, y, isFlyer };
+    return false;
+  }
+  makeObstacle(spriteName, y, isFlyer);
+  return true;
+}
+
+function alarm0() {
+  const set = BIOME_OBSTACLES[biomeCur];
+  const canLarge   = ctrl.score >= GATE_LARGE;
+  const canFlyer   = ctrl.score >= GATE_FLYER;
+
+  let roll = Math.random();
+  let spriteName, y, isFlyer = false;
+  if (!canLarge) {
+    spriteName = set.small; y = GROUND_Y - SPR[set.small].h;
+  } else if (!canFlyer) {
+    if (roll < 0.65) { spriteName = set.small; y = GROUND_Y - SPR[set.small].h; }
+    else             { spriteName = set.large; y = GROUND_Y - SPR[set.large].h; }
+  } else {
+    if      (roll < 0.45) { spriteName = set.small; y = GROUND_Y - SPR[set.small].h; }
+    else if (roll < 0.80) { spriteName = set.large; y = GROUND_Y - SPR[set.large].h; }
+    else {
+      spriteName = set.flyer;
+      isFlyer = true;
+      y = (Math.random() < 0.5) ? FLYER_LOW_Y : FLYER_MID_Y;
+    }
+  }
+
+  if (!trySpawnObstacle(spriteName, y, isFlyer)) {
+    ctrl.alarm[0] = 12;
+    return;
+  }
+  ctrl.alarm[0] = obstacleInterval();
+}
+
+function alarm1() {
+  if (ctrl.score < GATE_BLOCK) { ctrl.alarm[1] = 120; return; }
+  const y = choose(...BLOCK_TOPS);
+  const r = { x: SPAWN_X, y, w: 200, h: 30 };
+  if (rectOverlapsAny(r, SPAWN_MARGIN)) { ctrl.alarm[1] = 30; return; }
+  blocks.push({ x: SPAWN_X, y, w: 200, h: 30 });
+  ctrl.alarm[1] = blockInterval();
+}
+
+function alarm2() {
+  const before = ctrl.score;
+  ctrl.score += 1 + Math.floor((ctrl.speed - SPEED_START) * 0.5);
+  // Score can jump by more than 1, so compare hundreds instead of testing score % 100
+  if (Math.floor(ctrl.score / MILESTONE) > Math.floor(before / MILESTONE)) {
+    ctrl.flashTimer = FLASH_STEPS;
+    sfx.milestone();
+  }
+  ctrl.alarm[2] = SCORE_ALARM;
+}
+
+/* --- Step --- */
+function step() {
+  if (!dino.dead) {
+    if (pendingObstacle) {
+      const p = pendingObstacle;
+      if (trySpawnObstacle(p.spriteName, p.y, p.isFlyer)) pendingObstacle = null;
+    }
+    const fns = [alarm0, alarm1, alarm2];
+    for (let i = 0; i < 3; i++) if (ctrl.alarm[i] > 0 && --ctrl.alarm[i] === 0) fns[i]();
+    ctrl.steps++;
+    if (ctrl.speed < SPEED_MAX) ctrl.speed = Math.min(SPEED_MAX, ctrl.speed + SPEED_ACCEL);
+    if (++ctrl.dayTimer >= (ctrl.night ? NIGHT_STEPS : DAY_STEPS)) { ctrl.dayTimer = 0; ctrl.night = !ctrl.night; }
+    updateBiome();
+    updateWeather();
+    const fx = (!weather.draining && WEATHER_FX[weather.type]) || { grav: 1, speed: 1 };
+    ctrl.fxGrav  += (fx.grav  - ctrl.fxGrav)  * FX_EASE;
+    ctrl.fxSpeed += (fx.speed - ctrl.fxSpeed) * FX_EASE;
+    if (ctrl.flashTimer > 0) ctrl.flashTimer--;
+  } else {
+    ctrl.deathTimer++;
+  }
+
+  // Night: toggle the CSS overlay on/off (it animates itself)
+  if (ctrl.night !== nightShown) {
+    nightShown = ctrl.night;
+    nightVeil.style.opacity = nightShown ? '0.45' : '0';
+  }
+
+  stepDino(); stepWorld(); checkCollisions();
+}
+
+function standingOn() {
+  const feet = dino.y + 94;
+  if (Math.abs(feet - GROUND_Y) < 0.5) return true;
+  for (const b of blocks) if (Math.abs(feet - b.y) < 0.5 && overlapsX(b)) return true;
+  return false;
+}
+function overlapsX(b) { return dino.x + 70 > b.x && dino.x + 16 < b.x + b.w; }
+
+function stepDino() {
+  const d = dino, grounded = standingOn();
+  if (!d.dead) {
+    if (input.jumpPressed) {
+      if (grounded && d.jumpsUsed === 0) { d.vspeed = -JUMP_V;  d.jumpsUsed = 1; sfx.jump(); }
+      else if (!grounded && d.jumpsUsed === 1) { d.vspeed = -JUMP_V2; d.jumpsUsed = 2; sfx.doubleJump(); }
+    }
+  }
+  input.jumpPressed = false;
+
+  const fastFall = input.down && !grounded;
+  d.vspeed += GRAVITY * ctrl.fxGrav + (fastFall ? FAST_FALL_EXTRA_G : 0);
+  d.y += d.vspeed;
+  if (d.y < 0) { d.y = 0; d.vspeed = 0; }
+
+  if (d.vspeed >= 0) {
+    const feet = d.y + 94, prevFeet = feet - d.vspeed;
+    let landed = false;
+    if (feet >= GROUND_Y) { d.y = GROUND_Y - 94; landed = true; }
+    else for (const b of blocks) {
+      if (overlapsX(b) && prevFeet <= b.y + 0.5 && feet >= b.y) { d.y = b.y - 94; landed = true; break; }
+    }
+    if (landed) { d.vspeed = 0; d.jumpsUsed = 0; }
+  }
+
+  const onSurface = standingOn();
+  let spr;
+  if (d.dead)          spr = 'spr_dino_dead';
+  else if (!onSurface) spr = 'spr_dino_jump';
+  else if (input.down) spr = 'spr_dino_duck';
+  else                 spr = 'spr_dino_run';
+  if (spr !== d.sprite) { d.sprite = spr; d.image_index = 0; d.animTimer = 0; }
+  if (!d.dead && SPR[spr].n > 1 && onSurface) {
+    if (++d.animTimer >= ANIM_STEPS) { d.animTimer = 0; d.image_index = (d.image_index + 1) % SPR[spr].n; }
+  }
+}
+
+function stepWorld() {
+  const moving = !dino.dead, sp = moving ? ctrl.speed * ctrl.fxSpeed : 0;
+  ctrl.bgOffset = (ctrl.bgOffset + sp) % SPR.spr_ground1.w;
+  for (const c of ctrl.clouds) { c.x -= sp * 0.25; if (c.x < -120) { c.x = ROOM_W + 60 + Math.random() * 300; c.y = 120 + Math.random() * 160; } }
+  for (let i = obstacles.length - 1; i >= 0; i--) {
+    const o = obstacles[i]; o.x -= sp;
+    if (o.isFlyer && moving) {
+      if (++o.animTimer >= ANIM_STEPS) { o.animTimer = 0; o.image_index = 1 - o.image_index; }
+    }
+    if (o.x + SPR[o.sprite].w <= 0) obstacles.splice(i, 1);
+  }
+  for (let i = blocks.length - 1; i >= 0; i--) { blocks[i].x -= sp; if (blocks[i].x + blocks[i].w <= 0) blocks.splice(i, 1); }
+}
+
+function checkCollisions() {
+  if (dino.dead) return;
+  const ds = SPR[dino.sprite];
+  for (const o of obstacles) {
+    if (pixelCollide(dino.x, dino.y, ds, dino.image_index % ds.n, o.x, o.y, SPR[o.sprite], o.image_index)) {
+      dino.dead = true; dino.sprite = 'spr_dino_dead'; dino.image_index = 0; dino.jumpsUsed = 0;
+      ctrl.deathTimer = 0; ctrl.alarm[0] = ctrl.alarm[1] = ctrl.alarm[2] = -1;
+      if (ctrl.score > highscore) highscore = ctrl.score;
+      ctrl.flashTimer = 0;
+      sfx.death();
+      saveHigh(); return;
+    }
+  }
+}
+
+/* --- Drawing --- */
+function drawSpr(name, frame, x, y) { const s = SPR[name]; ctx.drawImage(s.frames[frame % s.n], Math.round(x), Math.round(y)); }
+
+function currentBg() {
+  const a = BG_COLORS[biomePrev] || BG_COLORS[biomeCur];
+  const b = BG_COLORS[biomeCur];
+  const t = biomeBlend;
+  return [
+    Math.round(lerp(a[0], b[0], t)),
+    Math.round(lerp(a[1], b[1], t)),
+    Math.round(lerp(a[2], b[2], t)),
+  ];
+}
+
+function drawScene() {
+  const bg = currentBg();
+  ctx.fillStyle = `rgb(${bg[0]},${bg[1]},${bg[2]})`;
+  ctx.fillRect(0, 0, ROOM_W, ROOM_H);
+
+  if (weather.type === 'meteor') drawMeteors();
+
+  const underwater = biomeCur === 'ocean' && biomeBlend > 0.4;
+  if (!underwater) {
+    ctx.fillStyle = '#e2e2e2';
+    for (const cl of ctrl.clouds) {
+      ctx.beginPath(); ctx.arc(cl.x, cl.y, 16, 0, Math.PI*2); ctx.arc(cl.x+22, cl.y-10, 22, 0, Math.PI*2);
+      ctx.arc(cl.x+48, cl.y, 16, 0, Math.PI*2); ctx.fill(); ctx.fillRect(cl.x-16, cl.y, 80, 16);
+    }
+  }
+
+  const gCur = SPR['spr_ground1_' + biomeCur];
+  const gPrev = SPR['spr_ground1_' + biomePrev] || gCur;
+  ctx.globalAlpha = 1;
+  for (let x = -ctrl.bgOffset; x < ROOM_W; x += SPR.spr_ground1.w) {
+    if (biomeBlend < 1) {
+      ctx.globalAlpha = 1 - biomeBlend;
+      ctx.drawImage(gPrev.frames[0], Math.round(x), GROUND_Y);
+    }
+    ctx.globalAlpha = biomeBlend;
+    ctx.drawImage(gCur.frames[0], Math.round(x), GROUND_Y);
+  }
+  ctx.globalAlpha = 1;
+
+  drawBlocks();
+  for (const o of obstacles) drawSpr(o.sprite, o.image_index, o.x, o.y);
+  drawSpr(dino.sprite, dino.image_index, dino.x, dino.y);
+
+  if (weather.type && weather.type !== 'meteor') drawWeather();
+
+  if (ctrl.score > highscore) highscore = ctrl.score;
+  const hudColor = biomeCur === 'ocean' ? '#3a6a90' : '#808080';
+  if (hintColor !== hudColor) { hintColor = hudColor; hintEl.style.color = hudColor; }
+  ctx.font = '50px "Courier New", Courier, monospace';
+  ctx.fillStyle = hudColor;
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  const rb = replayBounds();
+  // Milestone blink: hide the current score in alternating phases.
+  // Monospace font, so blank padding keeps HI in place.
+  const scoreHidden = ctrl.flashTimer > 0 && Math.floor(ctrl.flashTimer / FLASH_PHASE) % 2 === 1;
+  const scoreText = scoreHidden ? ' '.repeat(pad(ctrl.score).length) : pad(ctrl.score);
+  ctx.fillText('HI ' + pad(highscore) + '  ' + scoreText, rb.x - 30, rb.y + rb.h/2);
+  drawSpr('spr_replay', 0, rb.x, rb.y);
+
+  if (dino.dead) {
+    const go = SPR.spr_gameover;
+    const gx = ROOM_W/2 - go.w/2, gy = ROOM_H/2 - go.h/2;
+    drawSpr('spr_gameover', 0, gx, gy);
+    ctx.font = '22px "Courier New", Courier, monospace';
+    ctx.textAlign = 'center'; ctx.fillStyle = '#535353';
+    ctx.fillText('press SPACE / click to play again', ROOM_W/2, gy + go.h + 40);
+  }
+}
+
+function drawBlocks() {
+  const paint = (name, alpha) => {
+    ctx.globalAlpha = alpha;
+    const s = SPR[name];
+    for (const b of blocks) ctx.drawImage(s.frames[0], Math.round(b.x), Math.round(b.y));
+    ctx.globalAlpha = 1;
+  };
+  const prev = 'spr_block_' + biomePrev;
+  const cur  = 'spr_block_' + biomeCur;
+  if (biomeBlend < 1) paint(prev, 1 - biomeBlend);
+  if (biomeBlend > 0) paint(cur, biomeBlend);
+}
+
+/* Distant meteors: one radial gradient per body, no stacked alpha. */
+function drawMeteors() {
+  const fade = (weather.draining && !biomeHasMeteors(biomeCur)) ? 1 - biomeBlend : 1;
+  if (fade <= 0) return;
+  ctx.globalAlpha = fade;
+  for (const p of weather.particles) {
+    const size = p.size;
+
+    // Soft halo glow
+    const haloR = size * 1.55;
+    const halo = ctx.createRadialGradient(p.x, p.y, size * 0.7, p.x, p.y, haloR);
+    halo.addColorStop(0, 'rgba(60, 60, 85, 0.35)');
+    halo.addColorStop(1, 'rgba(60, 60, 85, 0)');
+    ctx.fillStyle = halo;
+    ctx.beginPath(); ctx.arc(p.x, p.y, haloR, 0, Math.PI*2); ctx.fill();
+
+    // Shaded body
+    const body = ctx.createRadialGradient(
+      p.x - size * 0.35, p.y - size * 0.35, size * 0.1,
+      p.x, p.y, size
+    );
+    body.addColorStop(0,   'rgba(140, 140, 160, 1)');
+    body.addColorStop(0.45,'rgba(85, 85, 105, 1)');
+    body.addColorStop(1,   'rgba(45, 45, 62, 1)');
+    ctx.fillStyle = body;
+    ctx.beginPath(); ctx.arc(p.x, p.y, size, 0, Math.PI*2); ctx.fill();
+
+    // Static craters, positioned per-particle seed
+    ctx.fillStyle = 'rgba(28, 28, 42, 0.55)';
+    const s = p.seed;
+    for (let i = 0; i < 4; i++) {
+      const ang = (s + i * 1.7) % (Math.PI * 2);
+      const rr  = size * (0.15 + ((s * (i + 3)) % 40) / 100);
+      const cr  = size * (0.08 + ((s * (i + 5)) % 15) / 100);
+      ctx.beginPath();
+      ctx.arc(p.x + Math.cos(ang) * rr, p.y + Math.sin(ang) * rr, cr, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawWeather() {
+  const w = weather;
+  if (!w.type) return;
+
+  if (w.type === 'rain') {
+    ctx.strokeStyle = 'rgba(100, 150, 220, 0.7)'; ctx.lineWidth = 2;
+    for (const p of w.particles) {
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - 3, p.y + 10); ctx.stroke();
+    }
+  } else if (w.type === 'snow') {
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+    for (const p of w.particles) { ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.fill(); }
+  } else if (w.type === 'sandstorm') {
+    ctx.fillStyle = 'rgba(210, 180, 100, 0.55)';
+    for (const p of w.particles) { ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, Math.PI*2); ctx.fill(); }
+    ctx.fillStyle = 'rgba(210, 180, 100, 0.12)'; ctx.fillRect(0, 0, ROOM_W, ROOM_H);
+  } else if (w.type === 'bubbles') {
+    ctx.strokeStyle = 'rgba(190, 230, 255, 0.7)'; ctx.lineWidth = 1;
+    for (const p of w.particles) {
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.stroke();
+    }
+  }
+}
+
+/* --- Fixed-step loop --- */
+const STEP_MS = 1000 / 60;
+let acc = 0, last = performance.now();
+function loop(now) {
+  requestAnimationFrame(loop);
+  let dt = now - last; last = now;
+  if (dt > 120) dt = 120;
+  acc += dt;
+  while (acc >= STEP_MS) { step(); acc -= STEP_MS; }
+  drawScene();
+}
+
+loadAllSprites()
+  .then(() => { room_start(); last = performance.now(); requestAnimationFrame(loop); })
+  .catch(err => { document.getElementById('loading').textContent = 'Failed: ' + err.message; console.error(err); });
+</script>
+</body>
+</html>
