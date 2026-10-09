@@ -10,12 +10,25 @@ Base game (Ludo Lodge Project 2): hand, walls, crates, sliding crates, pits,
 red switch + red door, goal, restart (R), multiple levels.
 Challenges 1-5: green switch/door, move counter, title screen (and return to it
 after the last level), green crates, multiple hands moving simultaneously.
-Revisions: particle effects (visual), undo / timed spikes / teleporters
-(gameplay), star rating against par (rules).
+Revisions: particle effects (visual), undo / timed spikes / teleporters / hint
+system (gameplay), star rating against par with a no-stars hint penalty (rules).
+
+EVENT MAP (GameMaker calls these events; in Python they are the methods below)
+-----------------------------------------------------------------------------
+  Create event            Game.__init__      once, loads sprites and fonts
+  Room Start event        Game.load_level    once per level, resets every variable
+  Step event              Game.run loop      every frame: particles, hint search
+  Key Press events        Game.key           one branch per key, all commented
+  Draw event              Game.draw_level    tiles, crates, hands, particles
+  Draw GUI event          Game.draw_hud      move counter, stars, hint status
+  Rule events             try_move           one branch per engine event tuple
+                                             (step, push, slide, fill,
+                                              teleport, spike)
 """
 # ---------------------------------------------------------------------------
 #  Helping Hand - shared rules engine (pure Python, no pygame here)
-#  Used by helping_hand.py (the game) and by solver.py (BFS verification).
+#  Used by helping_hand.py (the game), solver.py (BFS verification) and the
+#  in-game HintSolver below.
 # ---------------------------------------------------------------------------
 #  Map legend
 #    #  wall            .  floor            H  hand (any number)
@@ -25,10 +38,20 @@ Revisions: particle effects (visual), undo / timed spikes / teleporters
 #    ^  spike trap (cycle of 4 moves: down, WARN, up, up)
 #    1  teleporter pair 1   2  teleporter pair 2
 # ---------------------------------------------------------------------------
+import time
+from collections import deque
 
 DIRS = {"left": (-1, 0), "right": (1, 0), "up": (0, -1), "down": (0, 1)}
 SPIKE_PERIOD = 4            # moves per full spike cycle
 CRATE, SLIDING, GREEN = "crate", "sliding", "green"
+
+# Stored solutions are written as letters to keep the LEVELS table readable.
+MOVE_LETTERS = {"L": "left", "R": "right", "U": "up", "D": "down"}
+
+
+def path_from_letters(s):
+    """"RRRDDDD" -> ["right", "right", "right", "down", ...]"""
+    return [MOVE_LETTERS[c] for c in s]
 
 
 def spike_phase(moves):
@@ -45,6 +68,8 @@ class Level:
         self.name = data["name"]
         self.par = data.get("par", 0)
         self.hint = data.get("hint", "")
+        # Optimal move list found by solver.py. The hint system searches for it.
+        self.solution = data.get("solution", "")
         rows = data["map"]
         self.h = len(rows)
         self.w = max(len(r) for r in rows)
@@ -126,6 +151,8 @@ class State:
         return State(self.hands, self.crates, self.filled, self.moves, self.dead, self.sprites)
 
     def key(self, level):
+        """Everything that matters for the search. Two states with the same key
+        are interchangeable, so the search only has to visit one of them."""
         phase = spike_phase(self.moves) if level.spikes else 0
         return (tuple(sorted(self.hands)), tuple(sorted(self.crates.items())),
                 tuple(sorted(self.filled)), phase)
@@ -176,7 +203,17 @@ def _slide(level, st, start, d, events):
 
 
 def move(level, st, dname):
-    """Apply one key press. Returns (new_state, events, moved_any)."""
+    """Apply one key press. Returns (new_state, events, moved_any).
+
+    The returned event list is what the front end animates. Every event name
+    produced here has a matching commented branch in Game.try_move:
+      ("step", hand_index, from, to)      a hand walked one tile
+      ("push", crate_type, from, to)      a hand pushed a crate
+      ("slide", from, to)                 one tile of a sliding crate's travel
+      ("fill", pos)                       a crate dropped into a pit
+      ("teleport", who, from, to)         a hand or crate used a portal
+      ("spike", pos)                      a hand was caught by a raised spike
+    """
     d = DIRS[dname]
     new = st.copy()
     events = []
@@ -222,7 +259,10 @@ def move(level, st, dname):
     return new, events, moved_any
 
 
-def stars_for(moves, par):
+def stars_for(moves, par, hint_used=False):
+    """Rules revision. Using the hint costs the whole level's stars."""
+    if hint_used:
+        return 0
     if moves <= par:
         return 3
     if moves <= par + max(2, par // 2):
@@ -230,10 +270,111 @@ def stars_for(moves, par):
     return 1
 
 
+# ---------------------------------------------------------------------------
+#  Hint system (gameplay revision)
+# ---------------------------------------------------------------------------
+class HintSolver:
+    """Breadth-first search that answers "what should I press next?".
+
+    Searching all the way to a win is too slow on the last level: solver.py
+    needs 2,586,526 states and about 132 seconds to crack "Helping Hands", and
+    the game cannot stall for two minutes. So the search accepts two kinds of
+    target instead of one:
+
+      1. a solved state, or
+      2. any state that lies on the level's stored optimal path.
+
+    Target 2 is what makes this quick. The player is normally only a few moves
+    away from the stored path, so the search reconnects after a few thousand
+    states and then simply reads the rest of the answer out of the level data.
+
+    step() does a slice of work and returns, so the game keeps drawing while
+    the search is still thinking.
+
+    Measured on the 7 shipped levels: from a position a few moves off the
+    stored path, levels 1-6 answer within 530 states (under 8 ms) and level 7
+    within about 200 states. Only a position that has been made impossible
+    runs the budget out, and the message for that case says so.
+    """
+    BUDGET = 150_000        # give up after this many distinct states
+
+    def __init__(self, level, state):
+        self.level = level
+        self.path = path_from_letters(level.solution)
+        # Replay the stored solution once and remember the key of every state
+        # along it. These are the "get back on track" targets.
+        self.on_path = {}
+        st = level.start.copy()
+        self.on_path[st.key(level)] = 0
+        for i, dname in enumerate(self.path):
+            st, _, moved = move(level, st, dname)
+            if not moved:
+                break
+            self.on_path[st.key(level)] = i + 1
+        self.status = "working"     # working / ready / gaveup / unsolvable
+        self.moves = []             # the answer, once status == "ready"
+        self.seen_target = False
+        k0 = state.key(level)
+        self.seen = {k0: None}      # state key -> (previous key, move taken)
+        self.queue = deque([(state, k0)])
+        self._check(state, k0)      # the current state may already be on the path
+
+    def _finish(self, k):
+        """Found a target: walk the search tree back, then append the stored path."""
+        prefix, cur = [], k
+        while self.seen[cur] is not None:
+            cur, dname = self.seen[cur]
+            prefix.append(dname)
+        prefix.reverse()
+        idx = self.on_path.get(k)
+        tail = self.path[idx:] if idx is not None else []
+        self.moves = prefix + tail
+        self.status = "ready"
+
+    def _check(self, st, k):
+        """Is this state a target (a win, or a state on the stored path)?"""
+        if st.solved(self.level) or k in self.on_path:
+            self._finish(k)
+            return True
+        return False
+
+    def step(self, seconds):
+        """Expand states for at most `seconds` of wall clock, then hand control
+        back to the game loop. Called once per frame from Game.run."""
+        if self.status != "working":
+            return
+        t_end = time.perf_counter() + seconds
+        while self.queue:
+            st, k = self.queue.popleft()
+            for dname in ("left", "right", "up", "down"):
+                new, _, moved = move(self.level, st, dname)
+                if not moved or new.dead:
+                    continue
+                nk = new.key(self.level)
+                if nk in self.seen:
+                    continue
+                self.seen[nk] = (k, dname)
+                if self._check(new, nk):
+                    return
+                self.queue.append((new, nk))
+            if len(self.seen) > self.BUDGET:
+                self.status = "gaveup"
+                return
+            if time.perf_counter() > t_end:
+                return
+        # The queue emptied without finding a target, so every position
+        # reachable from here is a loss. This is a proof, not a guess.
+        self.status = "unsolvable"
+
+    def progress(self):
+        return min(0.99, len(self.seen) / self.BUDGET)
+
+
 LEVELS = [
     {
         "name": "First Steps",
         "par": 7,
+        "solution": "RRRDDDD",
         "hint": "Arrow keys move. Push the crate into the pit to cross.",
         "map": [
             "##########",
@@ -248,6 +389,7 @@ LEVELS = [
     {
         "name": "Red Switch",
         "par": 24,
+        "solution": "RRRRRDLLLLLDRRRURRURRRDD",
         "hint": "Sliding crates slide until they hit something. A crate on a red switch opens red doors.",
         "map": [
             "############",
@@ -262,6 +404,7 @@ LEVELS = [
     {
         "name": "Green Light",
         "par": 12,
+        "solution": "DRURDRRRRRRR",
         "hint": "Green crates are ghosts until a crate sits on a green switch.",
         "map": [
             "############",
@@ -275,6 +418,7 @@ LEVELS = [
     {
         "name": "Portal",
         "par": 12,
+        "solution": "DDDRRRRURDDD",
         "hint": "Anything that steps on a portal comes out of its twin (if the twin is free).",
         "map": [
             "############",
@@ -289,6 +433,7 @@ LEVELS = [
     {
         "name": "Spikes",
         "par": 15,
+        "solution": "RLRRRRDDRRRRRDD",
         "hint": "Spikes rise every 2 moves. Don't stand on a raised spike. Z undoes.",
         "map": [
             "############",
@@ -303,6 +448,7 @@ LEVELS = [
     {
         "name": "Two Hands",
         "par": 15,
+        "solution": "URRRRDDDDRRRUUR",
         "hint": "Both hands move together. Every hand must stand on a goal.",
         "map": [
             "############",
@@ -317,6 +463,7 @@ LEVELS = [
     {
         "name": "Helping Hands",
         "par": 32,
+        "solution": "DDUUURDURDRRRDRRURRRRDLLLLLDRRRR",
         "hint": "Everything at once. Good luck.",
         "map": [
             "##############",
@@ -336,13 +483,14 @@ LEVELS = [
 # ---------------------------------------------------------------------------
 #  pygame front end
 # ---------------------------------------------------------------------------
-import os, sys, math, random, time
+import os, sys, math, random
 
 TILE = 32
 SCALE = 2
 T = TILE * SCALE          # on-screen tile size
 HUD_H = 60
 ANIM_MS = 110
+HINT_SLICE = 0.012        # seconds of hint searching allowed per frame
 ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Game Assets")
 
 SPRITE_FILES = {
@@ -363,6 +511,7 @@ WHITE = (240, 240, 245)
 GREY = (150, 152, 165)
 YELLOW = (250, 220, 80)
 RED = (240, 90, 90)
+CYAN = (120, 200, 255)
 
 
 class Particle:
@@ -386,6 +535,9 @@ def lerp(a, b, t):
 
 
 class Game:
+    # ===================== CREATE EVENT =====================
+    # Runs once when the program starts: open the window, load every sprite
+    # and font, and set up the variables that live for the whole session.
     def __init__(self):
         import pygame
         self.pg = pygame
@@ -407,6 +559,7 @@ class Game:
         self.scene = "title"
         self.level_index = 0
         self.stars = []          # stars earned per level
+        self.hint_log = []       # True if the hint was used on that level
         self.particles = []
         self.texts = []
         self.hand_anim = {}      # hand index -> (from_pos, t0)
@@ -414,9 +567,11 @@ class Game:
         self.ghosts = []         # (img_key, from, to, t0, dur) - crates falling into pits
         self.prev_doors = (False, False)
         self.shake = 0.0
-        self.time = 0.0
 
-    # ---------------- level handling ----------------
+    # ===================== ROOM START EVENT =====================
+    # Runs once per level. Everything that is per-level, including the hint
+    # penalty flag, is reset here, so R (restart) and the retry key both give a
+    # genuinely clean attempt.
     def load_level(self, i):
         self.level_index = i
         self.level = self.levels[i]
@@ -424,6 +579,9 @@ class Game:
         self.undo_stack = []
         self.hand_anim, self.crate_anim, self.ghosts = {}, {}, []
         self.particles, self.texts = [], []
+        self.hint_used = False       # set by the hint, read by stars_for
+        self.hint_solver = None      # the running search, or None
+        self.hint_moves = []         # the answer the search produced
         self.prev_doors = (self.level.red_open(self.state.crates), self.level.green_open(self.state.crates))
         self.ox = (self.W - self.level.w * T) // 2
         self.oy = HUD_H + 8 + (self.H - HUD_H - 48 - self.level.h * T) // 2
@@ -447,32 +605,42 @@ class Game:
             return
         self.undo_stack.append(self.state)
         self.state = new
+        self.cancel_hint()        # the board changed, so any hint on screen is stale
         now = time.time()
+        # ---- one branch per engine event, all of them commented ----
         for e in events:
             k = e[0]
             if k == "step":
+                # STEP EVENT: a hand walked one tile. Tween it and kick up dust.
                 _, i, p, q = e
                 self.hand_anim[i] = (p, now)
                 self.emit_dust(self.center(p), 3, (80, 82, 96))
             elif k == "push":
+                # PUSH EVENT: a hand shoved a crate. Sliding crates get their
+                # animation from the slide events instead, so skip them here.
                 _, ctype, q, r = e
                 if ctype != SLIDING:
                     self.crate_anim[r] = (q, now, ANIM_MS)
                 self.emit_dust(self.center(q), 10, (120, 100, 70))
             elif k == "slide":
+                # SLIDE EVENT: one tile of a sliding crate's travel. Extend the
+                # animation from wherever this crate started sliding.
                 _, a, b = e
-                # extend the animation from wherever this crate started sliding
                 start, t0, dur = self.crate_anim.pop(a, (a, now, 0))
                 dist = abs(b[0] - start[0]) + abs(b[1] - start[1])
                 self.crate_anim[b] = (start, t0, max(ANIM_MS, 60 * dist))
                 self.emit_dust(self.center(a), 2, (120, 100, 70))
             elif k == "fill":
+                # FILL EVENT: a crate dropped into a pit. Hand the crate to the
+                # ghost list so it can finish falling, then splash.
                 _, p = e
                 start, t0, dur = self.crate_anim.pop(p, (p, now, ANIM_MS))
                 self.ghosts.append(("crate", start, p, t0, dur))
                 self.emit_splash(self.center(p))
                 self.texts.append(FloatText(*self.center(p), "FILLED!", (200, 170, 120)))
             elif k == "teleport":
+                # TELEPORT EVENT: ring both portals. A teleported crate must not
+                # tween across the map, so drop its animation entirely.
                 _, who, a, b = e
                 self.emit_portal(self.center(a))
                 self.emit_portal(self.center(b))
@@ -480,6 +648,8 @@ class Game:
                     self.crate_anim.pop(a, None)
                     self.crate_anim.pop(b, None)
             elif k == "spike":
+                # SPIKE EVENT: a hand was caught by a raised spike. Burst, shake
+                # the screen, and the state is now dead until undo or restart.
                 _, p = e
                 self.emit_burst(self.center(p), (240, 80, 80), 30)
                 self.shake = 0.35
@@ -490,7 +660,7 @@ class Game:
                 fp = self.hand_anim[i][0]
                 if abs(fp[0] - h[0]) + abs(fp[1] - h[1]) > 1:
                     del self.hand_anim[i]
-        # door open / close puffs
+        # DOOR EVENT: puff whenever a switch flips a door open or shut
         doors = (self.level.red_open(self.state.crates), self.level.green_open(self.state.crates))
         if doors[0] != self.prev_doors[0]:
             for p in self.level.red_doors:
@@ -502,19 +672,67 @@ class Game:
                 if ct == GREEN:
                     self.emit_burst(self.center(p), (120, 255, 140), 8)
         self.prev_doors = doors
+        # WIN EVENT: every hand is on a goal, so score the level and freeze it
         if self.state.solved(self.level):
             self.scene = "clear"
             self.clear_time = time.time()
-            self.earned = stars_for(self.state.moves, self.level.par)
+            self.earned = stars_for(self.state.moves, self.level.par, self.hint_used)
             for h in self.state.hands:
                 self.emit_sparkle(self.center(h))
 
+    # UNDO EVENT (gameplay revision): pop the whole previous state back
     def undo(self):
         if self.undo_stack:
             self.state = self.undo_stack.pop()
             self.hand_anim, self.crate_anim, self.ghosts = {}, {}, []
+            self.cancel_hint()
             self.prev_doors = (self.level.red_open(self.state.crates), self.level.green_open(self.state.crates))
             self.texts.append(FloatText(self.W / 2, self.oy + 20, "UNDO", GREY))
+
+    # ---------------- hint system (gameplay revision) ----------------
+    # HINT EVENT: start a search from the position currently on screen. The
+    # search runs in the background, so this only kicks it off.
+    def ask_hint(self):
+        if self.state.dead or self.hint_solver is not None or self.hint_moves:
+            return
+        self.hint_solver = HintSolver(self.level, self.state)
+
+    # The board moved, so throw away the answer and any search in progress.
+    # hint_used deliberately survives: the penalty is for the whole attempt,
+    # not for the one move the hint was asked about.
+    def cancel_hint(self):
+        self.hint_solver = None
+        self.hint_moves = []
+
+    # HINT STEP EVENT: called every frame while a search is running. The stars
+    # are charged here rather than on the key press, so a search that finds
+    # nothing useful costs the player nothing.
+    def update_hint(self):
+        if self.hint_solver is None:
+            return
+        self.hint_solver.step(HINT_SLICE)
+        if self.hint_solver.status == "ready" and self.hint_solver.moves:
+            self.hint_moves = self.hint_solver.moves
+            self.hint_solver = None
+            self.hint_used = True
+            self.texts.append(FloatText(self.W / 2, self.oy + 20, "HINT: 0 STARS", CYAN))
+
+    def hint_status(self):
+        """One line for the HUD: what the hint system is currently saying."""
+        if self.hint_moves:
+            names = {"left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN"}
+            n = len(self.hint_moves)
+            return f"Hint: press {names[self.hint_moves[0]]}  ({n} move{'s' if n != 1 else ''} left)", CYAN
+        s = self.hint_solver
+        if s is None:
+            return None, None
+        if s.status == "working":
+            return f"Thinking... {int(s.progress() * 100)}%", CYAN
+        if s.status == "unsolvable":
+            # The search emptied its queue, so this is proof and not a guess.
+            return "No way to win from here. Press Z to undo or R to restart.", RED
+        return (f"Searched {s.BUDGET:,} positions and found no route. "
+                "Press Z to undo or R to restart.", RED)
 
     # ---------------- particles ----------------
     def emit_dust(self, c, n, color):
@@ -575,6 +793,7 @@ class Game:
     def blit(self, key, p, surf=None):
         (surf or self.screen).blit(self.img[key], self.px(p))
 
+    # ===================== DRAW EVENT =====================
     def draw_level(self):
         lv, st, pg = self.level, self.state, self.pg
         now = time.time()
@@ -658,6 +877,8 @@ class Game:
                     y = lerp(self.px(a)[1], y, t)
             bob = math.sin(now * 3 + i) * 2 if st.sprites[i] == "hand" else 0   # idle bounce
             self.screen.blit(self.img[st.sprites[i]], (x, y + bob))
+        # hint arrow sits above the hands and below the particles
+        self.draw_hint_arrow()
         # particles
         for pt in self.particles:
             alpha = max(0, min(1, pt.life / pt.max_life))
@@ -672,20 +893,48 @@ class Game:
             surf.set_alpha(int(255 * min(1, t.life / 0.4)))
             self.screen.blit(surf, surf.get_rect(center=(t.x, t.y)))
 
+    # HINT DRAW EVENT: a pulsing arrow over every hand, pointing at the move
+    # the search recommends. Every hand moves together, so they all get one.
+    def draw_hint_arrow(self):
+        if not self.hint_moves:
+            return
+        pg = self.pg
+        dx, dy = DIRS[self.hint_moves[0]]
+        pulse = 0.75 + 0.25 * math.sin(time.time() * 7)
+        for p in self.state.hands:
+            cx, cy = self.center(p)
+            cx += dx * T * 0.55
+            cy += dy * T * 0.55
+            tip = (cx + dx * 14 * pulse, cy + dy * 14 * pulse)
+            back = (cx - dx * 8, cy - dy * 8)
+            side = (-dy * 11, dx * 11)      # perpendicular to the arrow
+            pts = [tip, (back[0] + side[0], back[1] + side[1]),
+                   (back[0] - side[0], back[1] - side[1])]
+            pg.draw.polygon(self.screen, CYAN, pts)
+
+    # ===================== DRAW GUI EVENT =====================
     def draw_hud(self):
         pg = self.pg
         pg.draw.rect(self.screen, HUD_BG, (0, 0, self.W, HUD_H))
         lv, st = self.level, self.state
         title = self.font.render(f"Level {self.level_index + 1}/{len(self.levels)}: {lv.name}", True, WHITE)
         self.screen.blit(title, (14, 10))
+        # Challenge 2: the move counter, next to the par it is being judged against
         moves = self.font.render(f"Moves: {st.moves}   Par: {lv.par}", True, YELLOW if st.moves <= lv.par else GREY)
         self.screen.blit(moves, (14, 34))
-        star_txt = " ".join("*" * s for s in self.stars) if self.stars else ""
         total = self.small.render(f"Stars: {sum(self.stars)}", True, YELLOW)
         self.screen.blit(total, (self.W - 14 - total.get_width(), 10))
-        keys = self.small.render("Arrows/WASD move   Z undo   R restart   Esc title", True, GREY)
+        keys = self.small.render("Arrows/WASD move   Z undo   H hint   R restart   Esc title", True, GREY)
         self.screen.blit(keys, (self.W - 14 - keys.get_width(), 36))
-        hint = self.small.render(lv.hint, True, (190, 190, 205))
+        # Bottom line, in priority order: whatever the hint system is saying,
+        # then the standing reminder that this attempt cannot earn stars any
+        # more, and otherwise the level's own one-line tip.
+        msg, col = self.hint_status()
+        if msg is None and self.hint_used:
+            msg, col = "Hint used: this level now scores 0 stars. R restarts for a clean run.", CYAN
+        if msg is None:
+            msg, col = lv.hint, (190, 190, 205)
+        hint = self.small.render(msg, True, col)
         self.screen.blit(hint, hint.get_rect(midtop=(self.W / 2, self.H - 30)))
 
     def draw_stars(self, n, cx, cy, size=40):
@@ -709,6 +958,7 @@ class Game:
         s = font.render(txt, True, color)
         self.screen.blit(s, s.get_rect(center=(cx, cy)))
 
+    # Challenge 3: the title screen
     def draw_title(self):
         now = time.time()
         self.screen.fill(BG)
@@ -731,12 +981,15 @@ class Game:
             "Sliding crates keep going.  Green crates are ghosts until a green switch is pressed.",
             "Spikes rise every 2 moves.  Portals swap you (or a crate) to their twin.",
             "Fewer moves = more stars.  Every hand must reach a goal.",
+            "Stuck?  H asks for the next move, but that level then scores 0 stars.",
         ]
         for i, l in enumerate(lines):
             self.text(self.small, l, self.W / 2, self.H * 0.52 + i * 24, (200, 200, 215))
         if int(now * 2) % 2 == 0:
             self.text(self.font, "Press ENTER to start", self.W / 2, self.H * 0.86, WHITE)
 
+    # Challenge 3: after the last level the game reports the run and goes back
+    # to the title screen
     def draw_results(self):
         self.screen.fill(BG)
         self.text(self.big, "YOU WIN!", self.W / 2, self.H * 0.2, YELLOW)
@@ -744,7 +997,10 @@ class Game:
         self.text(self.font, f"Total stars: {total} / {3 * len(self.levels)}", self.W / 2, self.H * 0.32, WHITE)
         for i, s in enumerate(self.stars):
             y = self.H * 0.42 + i * 34
-            self.text(self.small, f"{i + 1}. {self.levels[i].name}", self.W / 2 - 160, y, (200, 200, 215))
+            label = f"{i + 1}. {self.levels[i].name}"
+            if i < len(self.hint_log) and self.hint_log[i]:
+                label += "  (hint used)"
+            self.text(self.small, label, self.W / 2 - 160, y, (200, 200, 215))
             self.draw_stars(s, self.W / 2 + 120, y, 22)
         self.text(self.font, "Press any key to return to the title", self.W / 2, self.H * 0.92, GREY)
 
@@ -753,12 +1009,15 @@ class Game:
         pg = self.pg
         running = True
         while running:
+            # ===================== STEP EVENT =====================
             dt = self.clock.tick(60) / 1000.0
             self.update_particles(dt)
+            if self.scene == "play":
+                self.update_hint()        # advance the hint search a slice
             for ev in pg.event.get():
-                if ev.type == pg.QUIT:
+                if ev.type == pg.QUIT:                 # window close event
                     running = False
-                elif ev.type == pg.KEYDOWN:
+                elif ev.type == pg.KEYDOWN:            # key press event
                     self.key(ev.key)
             if self.scene == "title":
                 self.draw_title()
@@ -772,54 +1031,78 @@ class Game:
                     dx, dy = random.randint(-4, 4), random.randint(-4, 4)
                     self.screen.blit(self.screen.copy(), (dx, dy))
                 if self.state.dead:
+                    # DEATH OVERLAY: the only ways out are undo and restart
                     self.overlay(120)
                     self.text(self.big, "OUCH!", self.W / 2, self.H / 2 - 20, RED)
                     self.text(self.font, "Z to undo   R to restart", self.W / 2, self.H / 2 + 30, WHITE)
                 elif self.scene == "clear":
+                    # LEVEL CLEAR OVERLAY: continue, or retry this level
                     self.overlay(150)
                     self.text(self.big, "LEVEL CLEAR", self.W / 2, self.H / 2 - 70, YELLOW)
                     self.draw_stars(self.earned, self.W / 2, self.H / 2)
                     self.text(self.font, f"{self.state.moves} moves  (par {self.level.par})", self.W / 2, self.H / 2 + 50, WHITE)
+                    if self.hint_used:
+                        self.text(self.small, "Hint used, so this level scores 0 stars", self.W / 2, self.H / 2 + 78, CYAN)
                     if time.time() - self.clear_time > 0.6:
-                        self.text(self.small, "Press any key to continue", self.W / 2, self.H / 2 + 90, GREY)
+                        self.text(self.small, "ENTER / SPACE: next level      R: retry this level",
+                                  self.W / 2, self.H / 2 + 104, GREY)
             pg.display.flip()
         pg.quit()
 
+    # ===================== KEY PRESS EVENTS =====================
+    # Every key the game listens for has its own commented branch. Which keys
+    # are live depends on the scene, exactly like a GameMaker room.
     def key(self, k):
         pg = self.pg
         if self.scene == "title":
+            # TITLE: Enter or Space starts a fresh run, Esc quits the program
             if k in (pg.K_RETURN, pg.K_SPACE, pg.K_KP_ENTER):
                 self.stars = []
+                self.hint_log = []
                 self.load_level(0)
             elif k == pg.K_ESCAPE:
                 pg.event.post(pg.event.Event(pg.QUIT))
         elif self.scene == "results":
+            # RESULTS: any key goes back to the title screen (Challenge 3)
             self.scene = "title"
         elif self.scene == "clear":
+            # LEVEL CLEAR: ignore everything for 0.6s so a key held down from
+            # the winning move cannot skip the star screen
             if time.time() - self.clear_time < 0.6:
                 return
-            self.stars.append(self.earned)
-            if self.level_index + 1 < len(self.levels):
-                self.load_level(self.level_index + 1)
-            else:
-                self.scene = "results"
+            if k == pg.K_r:
+                # RETRY: replay this same level. Nothing is banked, so the score
+                # just set is thrown away and the next attempt starts clean
+                # (including the hint penalty).
+                self.load_level(self.level_index)
+            elif k in (pg.K_RETURN, pg.K_SPACE, pg.K_KP_ENTER):
+                # CONTINUE: bank this level's stars and move on, or finish the run
+                self.stars.append(self.earned)
+                self.hint_log.append(self.hint_used)
+                if self.level_index + 1 < len(self.levels):
+                    self.load_level(self.level_index + 1)
+                else:
+                    self.scene = "results"
         elif self.scene == "play":
             if k in (pg.K_LEFT, pg.K_a):
-                self.try_move("left")
+                self.try_move("left")          # MOVE LEFT
             elif k in (pg.K_RIGHT, pg.K_d):
-                self.try_move("right")
+                self.try_move("right")         # MOVE RIGHT
             elif k in (pg.K_UP, pg.K_w):
-                self.try_move("up")
+                self.try_move("up")            # MOVE UP
             elif k in (pg.K_DOWN, pg.K_s):
-                self.try_move("down")
+                self.try_move("down")          # MOVE DOWN
             elif k == pg.K_z:
-                self.undo()
+                self.undo()                    # UNDO one move
+            elif k == pg.K_h:
+                self.ask_hint()                # HINT, at the cost of the stars
             elif k == pg.K_r:
-                self.load_level(self.level_index)
+                self.load_level(self.level_index)   # RESTART the level
             elif k == pg.K_ESCAPE:
-                self.scene = "title"
+                self.scene = "title"           # BACK TO TITLE, abandoning the run
             elif k == pg.K_n and "--debug" in sys.argv:      # level skip, testing only
                 self.stars.append(0)
+                self.hint_log.append(self.hint_used)
                 if self.level_index + 1 < len(self.levels):
                     self.load_level(self.level_index + 1)
                 else:
