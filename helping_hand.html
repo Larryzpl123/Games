@@ -7,23 +7,37 @@
 <!--
   Helping Hand - HTML version. Open this file in any browser; everything (code + sprites) is inside.
   Base game (Ludo Lodge Project 2) + Challenges 1-5 (green switch/door, move counter, title screen,
-  green crates, multiple hands) + revisions: particle effects, undo / timed spikes / teleporters,
-  star rating against par.
+  green crates, multiple hands) + revisions: particle effects, undo / timed spikes / teleporters /
+  hint system, star rating against par with a no-stars hint penalty.
+
+  EVENT MAP (GameMaker calls these events; here they are the methods of class Game)
+    Create event       Game.constructor   once, loads the sprites and hooks up the keyboard
+    Room Start event   loadLevel          once per level, resets every per-level variable
+    Step event         loop               every frame: particles, hint search, redraw
+    Key Press events   key                one commented branch per key, per scene
+    Draw event         drawLevel          tiles, crates, hands, hint arrow, particles
+    Draw GUI event     drawHud            move counter, stars, hint status
+    Rule events        tryMove            one commented branch per engine event
+                                          (step, push, slide, fill, teleport, spike)
 -->
 <style>
   html, body { margin: 0; height: 100%; background: #1c1d26; color: #f0f0f5; font-family: "Segoe UI", Helvetica, Arial, sans-serif; }
   body { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; }
   canvas { image-rendering: pixelated; image-rendering: crisp-edges; max-width: 100vw; max-height: 100vh; outline: none; }
   #touch { display: none; gap: 6px; margin: 8px; }
-  #touch button { width: 56px; height: 56px; font-size: 22px; background: #2c2e3a; color: #fff; border: 1px solid #555; border-radius: 8px; }
+  #touch button { width: 56px; height: 56px; font-size: 20px; background: #2c2e3a; color: #fff; border: 1px solid #555; border-radius: 8px; }
   @media (pointer: coarse) { #touch { display: grid; grid-template-columns: repeat(3, 56px); } }
 </style>
 </head>
 <body>
 <canvas id="game" tabindex="0"></canvas>
+<!-- Touch controls. They only appear on a touch screen, and they feed the same
+     key handler as the keyboard, so H (hint) and Enter (start / continue) have
+     to be here too or a phone could not reach them. -->
 <div id="touch">
   <button data-k="z">Z</button><button data-k="ArrowUp">▲</button><button data-k="r">R</button>
   <button data-k="ArrowLeft">◀</button><button data-k="ArrowDown">▼</button><button data-k="ArrowRight">▶</button>
+  <button data-k="h">H</button><button data-k="Enter">OK</button>
 </div>
 <script>
 // ---------------------------------------------------------------------------
@@ -36,12 +50,17 @@ const CRATE = "crate", SLIDING = "sliding", GREEN = "green";
 const K = (x, y) => x + "," + y;                 // grid pos -> map key
 const P = (k) => k.split(",").map(Number);       // map key -> [x, y]
 
+// Stored solutions are written as letters to keep the LEVELS table readable.
+const MOVE_LETTERS = { L: "left", R: "right", U: "up", D: "down" };
+const pathFromLetters = (s) => [...s].map(c => MOVE_LETTERS[c]);
+
 function spikePhase(moves) { return moves % SPIKE_PERIOD; }
 function spikesUp(moves) { return spikePhase(moves) >= 2; }
 
 class Level {
   constructor(data) {
     this.name = data.name; this.par = data.par || 0; this.hint = data.hint || "";
+    this.solution = data.solution || "";   // optimal move list from solver.py, used by HintSolver
     const rows = data.map;
     this.h = rows.length; this.w = Math.max(...rows.map(r => r.length));
     this.walls = new Set(); this.pits = new Set(); this.goals = new Set(); this.spikes = new Set();
@@ -95,6 +114,16 @@ class State {
   }
   copy() { return new State(this.hands, this.crates, this.filled, this.moves, this.dead, this.sprites); }
   solved(level) { return !this.dead && this.hands.every(h => level.goals.has(h)); }
+  // Everything that matters to the hint search, flattened into one string.
+  // Two states with the same key are interchangeable, so the search only has
+  // to visit one of them. Sorting makes the string canonical.
+  key(level) {
+    const phase = level.spikes.size ? spikePhase(this.moves) : 0;
+    const hands = [...this.hands].sort().join(";");
+    const crates = [...this.crates].map(([k, v]) => k + ":" + v).sort().join(";");
+    const filled = [...this.filled].sort().join(";");
+    return hands + "|" + crates + "|" + filled + "|" + phase;
+  }
 }
 
 function add(k, d) { const [x, y] = P(k); return K(x + d[0], y + d[1]); }
@@ -138,6 +167,14 @@ function slide(level, st, start, d, events) {
   st.crates.set(cur, SLIDING);
 }
 
+// Apply one key press. Returns [newState, events, movedAny].
+// Every event name produced here has a matching commented branch in tryMove:
+//   ["step", handIndex, from, to]   a hand walked one tile
+//   ["push", crateType, from, to]   a hand pushed a crate
+//   ["slide", from, to]             one tile of a sliding crate's travel
+//   ["fill", pos]                   a crate dropped into a pit
+//   ["teleport", who, from, to]     a hand or crate used a portal
+//   ["spike", pos]                  a hand was caught by a raised spike
 function move(level, st, dname) {
   const d = DIRS[dname];
   const nw = st.copy();
@@ -179,14 +216,111 @@ function move(level, st, dname) {
   return [nw, events, movedAny];
 }
 
-function starsFor(moves, par) {
+// Rules revision. Using the hint costs the whole level's stars.
+function starsFor(moves, par, hintUsed) {
+  if (hintUsed) return 0;
   if (moves <= par) return 3;
   if (moves <= par + Math.max(2, Math.floor(par / 2))) return 2;
   return 1;
 }
 
+// ---------------------------------------------------------------------------
+//  Hint system (gameplay revision) - identical rules to the Python version
+// ---------------------------------------------------------------------------
+//  Breadth-first search that answers "what should I press next?".
+//
+//  Searching all the way to a win is too slow on the last level: solver.py
+//  needs 2,586,526 states to crack "Helping Hands". So the search accepts two
+//  kinds of target instead of one:
+//    1. a solved state, or
+//    2. any state that lies on the level's stored optimal path.
+//  Target 2 is what makes this quick. The player is normally only a few moves
+//  away from the stored path, so the search reconnects after a few hundred
+//  states and then reads the rest of the answer out of the level data.
+//
+//  step() does a slice of work and returns, so the page keeps animating while
+//  the search is still thinking.
+const HINT_BUDGET = 150000;        // give up after this many distinct states
+class HintSolver {
+  constructor(level, state) {
+    this.level = level;
+    this.path = pathFromLetters(level.solution);
+    // Replay the stored solution once and remember the key of every state
+    // along it. These are the "get back on track" targets.
+    this.onPath = new Map();
+    let st = level.start.copy();
+    this.onPath.set(st.key(level), 0);
+    for (let i = 0; i < this.path.length; i++) {
+      const [nw, , moved] = move(level, st, this.path[i]);
+      if (!moved) break;
+      st = nw;
+      this.onPath.set(st.key(level), i + 1);
+    }
+    this.status = "working";        // working / ready / gaveup / unsolvable
+    this.moves = [];                // the answer, once status === "ready"
+    const k0 = state.key(level);
+    this.seen = new Map([[k0, null]]);   // state key -> [previous key, move taken]
+    this.queue = [state]; this.qkeys = [k0]; this.head = 0;
+    this.check(state, k0);          // the current state may already be on the path
+  }
 
-const LEVELS = [{"name": "First Steps", "par": 7, "hint": "Arrow keys move. Push the crate into the pit to cross.", "map": ["##########", "#H.......#", "#...C....#", "#........#", "####O#####", "#...X....#", "##########"]}, {"name": "Red Switch", "par": 24, "hint": "Sliding crates slide until they hit something. A crate on a red switch opens red doors.", "map": ["############", "#H.....R...#", "#.....C#...#", "#.S..r.#.X.#", "#......#...#", "#......#...#", "############"]}, {"name": "Green Light", "par": 12, "hint": "Green crates are ghosts until a crate sits on a green switch.", "map": ["############", "#H.....#####", "#.C..G.D.OX#", "#..g...#####", "#......#####", "############"]}, {"name": "Portal", "par": 12, "hint": "Anything that steps on a portal comes out of its twin (if the twin is free).", "map": ["############", "#H....#....#", "#.....#1...#", "#.....#...O#", "#.S1..#..#X#", "#.....#..###", "############"]}, {"name": "Spikes", "par": 15, "hint": "Spikes rise every 2 moves. Don't stand on a raised spike. Z undoes.", "map": ["############", "#H....#....#", "#.##..#..#.#", "#....^^....#", "#.##..#..#.#", "#.....#...X#", "############"]}, {"name": "Two Hands", "par": 15, "hint": "Both hands move together. Every hand must stand on a goal.", "map": ["############", "#H....##...#", "#.....##...#", "#.C...##.X.#", "#H....##...#", "#....O..X..#", "############"]}, {"name": "Helping Hands", "par": 32, "hint": "Everything at once. Good luck.", "map": ["##############", "#H.....#######", "#..C...#^G.O.#", "#..r...R^###X#", "#......#######", "#.S....#######", "#H.....#######", "#.g1...##1OX##", "##############"]}];
+  // Found a target: walk the search tree back, then append the stored path.
+  finish(k) {
+    const prefix = [];
+    let cur = k;
+    while (this.seen.get(cur) !== null) {
+      const [prev, dname] = this.seen.get(cur);
+      prefix.push(dname); cur = prev;
+    }
+    prefix.reverse();
+    const idx = this.onPath.get(k);
+    const tail = idx === undefined ? [] : this.path.slice(idx);
+    this.moves = prefix.concat(tail);
+    this.status = "ready";
+  }
+  // Is this state a target (a win, or a state on the stored path)?
+  check(st, k) {
+    if (st.solved(this.level) || this.onPath.has(k)) { this.finish(k); return true; }
+    return false;
+  }
+  // Expand states for at most `ms` of wall clock, then hand control back to
+  // the game loop. Called once per frame from Game.loop.
+  step(ms) {
+    if (this.status !== "working") return;
+    const tEnd = performance.now() + ms;
+    while (this.head < this.queue.length) {
+      const i = this.head++;
+      const st = this.queue[i], k = this.qkeys[i];
+      this.queue[i] = null;         // processed, so let the browser reclaim it
+      for (const dname of ["left", "right", "up", "down"]) {
+        const [nw, , moved] = move(this.level, st, dname);
+        if (!moved || nw.dead) continue;
+        const nk = nw.key(this.level);
+        if (this.seen.has(nk)) continue;
+        this.seen.set(nk, [k, dname]);
+        if (this.check(nw, nk)) return;
+        this.queue.push(nw); this.qkeys.push(nk);
+      }
+      if (this.seen.size > HINT_BUDGET) { this.status = "gaveup"; return; }
+      if (performance.now() > tEnd) return;
+    }
+    // The queue emptied without finding a target, so every position reachable
+    // from here is a loss. This is a proof, not a guess.
+    this.status = "unsolvable";
+  }
+  progress() { return Math.min(0.99, this.seen.size / HINT_BUDGET); }
+}
+
+
+const LEVELS = [
+  {"name": "First Steps", "par": 7, "solution": "RRRDDDD", "hint": "Arrow keys move. Push the crate into the pit to cross.", "map": ["##########", "#H.......#", "#...C....#", "#........#", "####O#####", "#...X....#", "##########"]},
+  {"name": "Red Switch", "par": 24, "solution": "RRRRRDLLLLLDRRRURRURRRDD", "hint": "Sliding crates slide until they hit something. A crate on a red switch opens red doors.", "map": ["############", "#H.....R...#", "#.....C#...#", "#.S..r.#.X.#", "#......#...#", "#......#...#", "############"]},
+  {"name": "Green Light", "par": 12, "solution": "DRURDRRRRRRR", "hint": "Green crates are ghosts until a crate sits on a green switch.", "map": ["############", "#H.....#####", "#.C..G.D.OX#", "#..g...#####", "#......#####", "############"]},
+  {"name": "Portal", "par": 12, "solution": "DDDRRRRURDDD", "hint": "Anything that steps on a portal comes out of its twin (if the twin is free).", "map": ["############", "#H....#....#", "#.....#1...#", "#.....#...O#", "#.S1..#..#X#", "#.....#..###", "############"]},
+  {"name": "Spikes", "par": 15, "solution": "RLRRRRDDRRRRRDD", "hint": "Spikes rise every 2 moves. Don't stand on a raised spike. Z undoes.", "map": ["############", "#H....#....#", "#.##..#..#.#", "#....^^....#", "#.##..#..#.#", "#.....#...X#", "############"]},
+  {"name": "Two Hands", "par": 15, "solution": "URRRRDDDDRRRUUR", "hint": "Both hands move together. Every hand must stand on a goal.", "map": ["############", "#H....##...#", "#.....##...#", "#.C...##.X.#", "#H....##...#", "#....O..X..#", "############"]},
+  {"name": "Helping Hands", "par": 32, "solution": "DDUUURDURDRRRDRRURRRRDLLLLLDRRRR", "hint": "Everything at once. Good luck.", "map": ["##############", "#H.....#######", "#..C...#^G.O.#", "#..r...R^###X#", "#......#######", "#.S....#######", "#H.....#######", "#.g1...##1OX##", "##############"]}
+];
 const ASSETS = {"crate": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcklEQVR4nO2XsQoAMQhDK/iL95X3kZaDyyJ1s+qQLHYyz0BBdf0ye2wVSuSVr2ql6UnqJwdZdiK+L2p/AnjcmhxCX+8zJ4GqX+B95iRAAAIQgAAEIAABCECA21tx5DMngWhvz1LUtz+B6GbLVnSDtiewAV9ZQ7+oAHO8AAAAAElFTkSuQmCC", "floor": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgklEQVR4nGM0MXP5zzCAgIWBgYHhx49vA2I5BwcXA9OA2IwERh0w6oDB7wA+PoGBdcCnTx8G1gG0BqMOGL4OIDb30MwBxOae4RsFow4g2wG0LvsJOoDWZT9BB9AbDF0HUCutkO0AaqUVukUBrhCjmwNwhdjQTYTDxgEsDAyQXupAAQAfmBQL6SL98wAAAABJRU5ErkJggg==", "goal": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAVUlEQVR4nO3V0QkAIAhFUYX2X9kGyEghsuL6GQ86iGgTEZPCapWfA3ABZv5IqKr7ns0vAacLAIABsGvao/n7OgAAALcAAABuAQAAs4ru9mz+nQ58C+hC3xmMlqWg3QAAAABJRU5ErkJggg==", "green_crate": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcklEQVR4nO2XsQoAMQhDW/AX+5X9yB4Hl0Uum1WHZLGTeQYKauPTOuuMRO2551st0/RP5icHWXQivi9qfQJ43JocQl/v0yeBrF/gffokIAABCEAAAhCAAAQggNtbMfPpkwDb26PE+tYnwG62aLEbtDyBB1VrPxkw+sjzAAAAAElFTkSuQmCC", "green_crate_inactive": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAiUlEQVR4nO2XQQ6AIAwEIeGLvJJHYkzspXVjgoX2sHNBPJRh7aG28tBnn+Ugo456r+3koW80fXMxk/eyX0XXkb2s8QnIgzb0BiWRJwHUC39B394IRGF6YBe6fr4eoAAFKEABClCAArsmIlTfCEQBp2Lv/wJ0Tp4E0NzuBaobn8DX3O6VBOqF8AQuFnBdwdhjenQAAAAASUVORK5CYII=", "green_door": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAArElEQVR4nO1XQQ7AIAibiV/0lT7SnbgwG6EjkRh7mluQ0sHsahttPBP00svsPguUp0YmYfAhIJWzyqzi9PM8CmiGqFJUod4Hxek8+xWwVi5A79IbJ+v9CngDUA9YFfxNIBqXwPI7sJp7DTQdqEfyKKDhrZzdJ68ClwA7Bd598iiA5lSvWT9wzml4CbCOKIxANCo6/byu2BqXzxXLhdUHnPtnJGDdrcDbO9sVeAHJwJcpveNC9QAAAABJRU5ErkJggg==", "green_door_open": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAaklEQVR4nO2XMRIAEAwEmfFFr/RIqjSHxhAp9iqjSDZbJaX22tMiLbe8+j/Nrk+52eQkE8DtybWumohj4NXkGjXx34DX5Brr+98AAAAAAAAAAAAAAAC2nXrvhnG2Ynt4mYh7GVlemQh7HQ9jUyiBUlgD6wAAAABJRU5ErkJggg==", "green_switch": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAlklEQVR4nO2WQQrAMAgEU8gb+8h+sj15WdhqgiYYnGNrYVYTaW+b6SVQAvkEnvb+vr/bFSvgjC5gTSx1WK90JEEHBEzKkmGdm0AQXAATYHI2a+07s8AidAE0Z7PVOjQtEIx9DwxuOGsnEnRAmL0FbgJBcAG2+diZsNaZBRYxfga05+ecAYHNmiU9748IGd2I7gLOlEAJfJfTNs6xIJF4AAAAAElFTkSuQmCC", "hand": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgElEQVR4nO2VuwrAIAwAW/D/f9naIYsgiTFPyS1C6XC5htoeZ1oJpBPog/98By4C0qAC88Rwzs+5ZeIX4E5IfT9+gRXUXcBK5Clwuu3HAlqICUAZNwEuSwHsW2MTU4vELaC19WQBK0pg+zY0F9CmBNi3obmAFtsC0n/EfAWuE/gADHhEjUOsx+YAAAAASUVORK5CYII=", "hand_push_down": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcUlEQVR4nO2VMQ4AIAgDNfH/X1YXF6aiNIrpzQ5HqaGVyzQJSEACEkgj0CfIuzqhCLCQQLjA6grahfcTQNtPE2BDE0C78E8CdlK0O/kTWJPv/pY8CdhJ7c69V9AtwOJYwCby3y3Y3W2YABu3QHQi1xMYc94kjWaZTP4AAAAASUVORK5CYII=", "hand_push_left": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgUlEQVR4nO2VOQ7AIAwEg8T/vxxo7IIIORibpdhtKDg0Hq76gFMJQAACXAfw9qwsUHpCAU7nAzBWZBmZ9f81c4+B1b0PB0BFAWZ7lm0Gb8A6xdJmmcAbsO6rVJ5lAm9g9yXzjlcAz6TImGdAMpra/QUVIGKRVICoSt0A2SEAAQjQAAJaLInkJE2vAAAAAElFTkSuQmCC", "hand_push_right": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcElEQVR4nO2VQQrAIAwEK/j/L2suvSxdklrakrhzVJHJGmI/fqZLQAISKCMwjKv1ZnwisMqygFcx7rPzeRJgFURhvZAngShnUlhx/h64CyaxTw8g3ryon0Cdv4BV4k1I3Md78iTA8N74dYGnSEACEpjauCyB6LIh5QAAAABJRU5ErkJggg==", "hand_push_up": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAgUlEQVR4nO2WQQrAIAwEW/D/X6724CVUEjdZISVzEUFhsoZgu4w8g3e9B197lOa5HEGYAJrIfxKQWBPJk4CsxNv92wIsVIH5lhI5D7TzsAAbuAd2K3ULsDALRFUMC7BQBVbdfkyADU3AOinzJMDqhTwJlMAk6h8AC0RTAiVQAiXQAYyoLIUFdOadAAAAAElFTkSuQmCC", "pit": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAh0lEQVR4nO1X0QrAIAj0wd/s6/rQbTDcgyJFm7rpDqIuo844IhEAtqNBa+CK3s8efY+VQJ45KaN5ax5/AzTwzlwIiMIlgCslPMXrekDbXwiIgpkH8r4Ds8jrgdF6LZ7PA7Nxbb0QEIVlD4zi+T0wQj4P1P0T8vhd/h0P/HVBnbpAU2bNX1Md75yqsVRX0LcOAAAAAElFTkSuQmCC", "pit_filled": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAcUlEQVR4nO2XMQ7AMAgDGfhmXpeHtlElL1TeCDDYSzLhwxIS+Fr22NHeVqrj+8lrbf/y2DnIshOJdfH2J4DPrc4h1I0+cxKomoLoMycBAQhAAAIQgAAEIAAB3N6Kmc+cBNjeniVWtz8BdrNli92g7Qm8t7chJCR/nHEAAAAASUVORK5CYII=", "portal_1": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABDElEQVR4nOVXwQ3CMAxMEJN1DF4dgxEYgxdjsFp5gaL0fPY5qYRUP+vk7mI7jlvK2a2qG273bWP+16NKmOHFHnFWiLtIJVaFUKdFboGq66mAHkzNbXT/5QhytMeKzg44Qv58Y7B12a/18GAEMuSWTyrCVm2/sQfvT+v5LewrU4cMhbn9ziKE7JcCdt+/oBa5KqTlgjXQhsjLebQmpGuIjOXcyz+zsACLnH07TMBMSwlAIVbCnhLA8uz1BFlAe03YydalVs+PMKEA1jKVJhPpGUOd0CLI3gL6eqmPERLmYdIiRHmL5pxhtBYarTIDSRTHfQsQ0CzyUv55KPVAozY0lo8ImfZjogrJFux57QNWN9QwJgvYtgAAAABJRU5ErkJggg==", "portal_2": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABCklEQVR4nOVXwRHCMAxLOaboJLw7FSMwFW8mYY3wopcWWbac9I67+lnHkmI7TlrK2W1SA+r9VSng4yZhhhd7xFkh7iKVWBVCnRa5BaqupwL2YGpto/GXI8hRjJmdDHl9vjHYMst4MAMZcssnNWGr9ieFO/D9bl2/gX1l6qBikOb2O8sQsrUE7Lx/QS1yVUjLBXugTZFX82hPSMcQiiI19+rPLCzAImffDhMw0lICUIqVtKcEsDp7M0EWsBkaZGfTMk+eH2FCAfTKFIZMZGZ0TUKLIHsK6O2lXkZImIdJmxDVLVpzhrGJiRBnHiRRHPcuQECjyEv550epBxq1rmd5j5BhPyaqkGzDntc+bvnUMBHO39gAAAAASUVORK5CYII=", "red_door": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAArElEQVR4nO1XQQ7AIAibiV/0lT7SnbgwG6EjkRh7mluQ0sHs6mhtPBOU3svsPguUp0YmYfAhIJWzyqzi9PM8CmiGqFJUod4Hxek8+xWwVi5A79IbJ+v9CngDUA9YFfxNIBqXwPI7sJp7DTQdqEfyKKDhrZzdJ68ClwA7Bd598iiA5lSvWT9wzml4CbCOKIxANCo6/byu2BqXzxXLhdUHnPtnJGDdrcDbO9sVeAHKapcpI8WJQwAAAABJRU5ErkJggg==", "red_door_open": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAaklEQVR4nO2XMRIAEAwEmfFFr/RIqjSHxhAp9iqjSDZbJaXX2tMiubW8+j/Nrk+52eQkE8DtybWumohj4NXkGjXx34DX5Brr+98AAAAAAAAAAAAAAAC2nXrvhnG2Ynt4mYh7GVlemQh7HQ9jUyiBIvzHdgAAAABJRU5ErkJggg==", "red_switch": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAl0lEQVR4nO2WQQ6AMAgEMekbfaSf1BOXTVZoA7U2zFExmQXa2ORjWgmUwO8ELpH77f0pcqQKRGMKeBNrHdZbHVm/AwomZcmwLkwgCyqACTA5m7X1nVtgFqYAmrPZWh0aFsjGfQ/03nDeTqzfAWX0FIQJZEEF2M3HdsJb5xaYRfcOWM/32QGFzZol3e+PCOlNGC4QTQmUwAOyJTbOJAZe3AAAAABJRU5ErkJggg==", "sliding_crate": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAw0lEQVR4nM1XWwrAIAyb4BV3yh3SMVh/6kKqdJr8CLN0SVpf9XhxttaOhbhKKc9YV/70C5UpN6YGH8/mESxuvwNowpQhRV75bB4dB1Ato0pRPOoZvR5g3Y3glY/2jI4DBsSUKRvtGUhgNSgBVuPZ1RIm8Dc6AmzdzipF+XQcyK4xy9cR2IVuJ8yuMTsbdBzIrnE0n44DHtl7v/6NyBC99WbdlHQcYGeA/+4R7RlIYBeGVwGLG30p7XeA1ciDxUXzyLyObziMzFm5970xAAAAAElFTkSuQmCC", "spike_down": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAZElEQVR4nGNgGAUDDBiROW4eIf/pYemuHWvg9rKgS0pJSdHU8mfPnqHwmWhqGxFg1AGjDhh1wKgDRh0w6oBRB4w6YNQBow7AaBWjgzu3bsDZKmoaVJFDBoMvBNDb7bSWGwUDDgCFeRsCiM043wAAAABJRU5ErkJggg==", "spike_up": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAq0lEQVR4nGNgGAUDDBiROW4eIf/pYemuHWvg9rKgS0pJSdHU8mfPnqHwmWhqGxGAKAc01tdSXY4kB9ASDH4HwIIRW3CSK0eSA2gNhoYD7kYHUl2OJAfQEgxuB6CnYGQ+uXIkOYAegKADYAkJW4IiV44kB9AaDLgDMNoDMIAr4VBSM9Y3NmOID3gIjDpgcDsAPQ8j88mVI8oBxLTlyAHYzB18UYDebh8Fwx4AAEBZQbXtX1fQAAAAAElFTkSuQmCC", "spike_warn": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAoklEQVR4nGNgGAUDDBiROW4eIf/pYemuHWvg9rKgS0pJSdHU8mfPnqHwmWhqGxFg1AGjDhh1wKgDRh0w6oBRBxDlgLaYc1SXI8kBtAQEHQDzBTbfkCtHkgNoDfA6AN31yHxy5UhyAD0ARrMc1iomJgWTCqqWGDE8e/YMpVk+4CGA0S+AtdsTuiQYGBgYGL59+QSX4+LhQ1FLuhxqn2AUDAoAAPkiOCFQjvmtAAAAAElFTkSuQmCC", "wall": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAUklEQVR4nO3WMQoAIAxD0Q69oh5SD6lSKAjOmsGfrVMfgUK9FRsmjCuXAwhA7WKAdv0GWNcQyUZuzwdAFQAAAAAAAAAAAAAAPL/VzOtZ38D3gAnfVBl4frtHbAAAAABJRU5ErkJggg=="};
 </script>
 <script>
@@ -194,7 +328,8 @@ const ASSETS = {"crate": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAg
 //  Canvas front end
 // ---------------------------------------------------------------------------
 const T = 64, HUD_H = 60, ANIM_MS = 110;
-const BG = "#1c1d26", HUD_BG = "#12131a", WHITE = "#f0f0f5", GREY = "#9698a5", YELLOW = "#fadc50", RED = "#f05a5a";
+const HINT_SLICE_MS = 10;        // milliseconds of hint searching allowed per frame
+const BG = "#1c1d26", HUD_BG = "#12131a", WHITE = "#f0f0f5", GREY = "#9698a5", YELLOW = "#fadc50", RED = "#f05a5a", CYAN = "#78c8ff";
 const SPRITES = {
   hand: "hand", push_left: "hand_push_left", push_right: "hand_push_right", push_up: "hand_push_up", push_down: "hand_push_down",
   wall: "wall", floor: "floor", crate: "crate", sliding: "sliding_crate", green: "green_crate", green_inactive: "green_crate_inactive",
@@ -207,6 +342,9 @@ const rnd = (a, b) => a + Math.random() * (b - a);
 const now = () => performance.now();
 
 class Game {
+  // ===================== CREATE EVENT =====================
+  // Runs once when the page loads: size the canvas, decode every sprite, and
+  // set up the variables that live for the whole session.
   constructor(canvas) {
     this.cv = canvas; this.ctx = canvas.getContext("2d");
     this.levels = LEVELS.map(d => new Level(d));
@@ -221,23 +359,32 @@ class Game {
       im.src = ASSETS[SPRITES[key]];
       this.img[key] = im;
     }
-    this.scene = "title"; this.levelIndex = 0; this.stars = [];
+    this.scene = "title"; this.levelIndex = 0; this.stars = []; this.hintLog = [];
     this.particles = []; this.texts = []; this.handAnim = new Map(); this.crateAnim = new Map(); this.ghosts = [];
     this.shake = 0; this.last = now();
     this.seedSprites = Array.from({ length: 14 }, (_, k) => ({ sp: rnd(15, 40), x: rnd(0, this.W), y: rnd(0, this.H), key: ["crate", "sliding", "green", "hand"][k % 4] }));
+    // KEYBOARD EVENT: the arrow keys and space would scroll the page, so stop
+    // the browser handling them before passing the key on to the game.
     window.addEventListener("keydown", e => {
       if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
       this.key(e.key);
     });
+    // TOUCH EVENT: the on-screen buttons feed the same key handler
     document.querySelectorAll("#touch button").forEach(b => b.addEventListener("click", () => this.key(b.dataset.k)));
     requestAnimationFrame(() => this.loop());
   }
 
-  // ---------------- level handling ----------------
+  // ===================== ROOM START EVENT =====================
+  // Runs once per level. Everything per-level, including the hint penalty
+  // flag, is reset here, so R (restart) and the retry key both give a
+  // genuinely clean attempt.
   loadLevel(i) {
     this.levelIndex = i; this.level = this.levels[i]; this.state = this.level.start.copy();
     this.undoStack = []; this.handAnim = new Map(); this.crateAnim = new Map(); this.ghosts = [];
     this.particles = []; this.texts = [];
+    this.hintUsed = false;      // set by the hint, read by starsFor
+    this.hintSolver = null;     // the running search, or null
+    this.hintMoves = [];        // the answer the search produced
     this.prevDoors = [this.level.redOpen(this.state.crates), this.level.greenOpen(this.state.crates)];
     this.ox = Math.floor((this.W - this.level.w * T) / 2);
     this.oy = HUD_H + 8 + Math.floor((this.H - HUD_H - 48 - this.level.h * T) / 2);
@@ -254,33 +401,46 @@ class Game {
     if (!moved) return;
     this.undoStack.push(this.state);
     this.state = nw;
+    this.cancelHint();          // the board changed, so any hint on screen is stale
     const t = now();
+    // ---- one branch per engine event, all of them commented ----
     for (const e of events) {
       const k = e[0];
       if (k === "step") {
+        // STEP EVENT: a hand walked one tile. Tween it and kick up dust.
         const [, i, p] = e; this.handAnim.set(i, [p, t]);
         this.emitDust(this.center(p), 3, [80, 82, 96]);
       } else if (k === "push") {
+        // PUSH EVENT: a hand shoved a crate. Sliding crates get their
+        // animation from the slide events instead, so skip them here.
         const [, ctype, q, r] = e;
         if (ctype !== SLIDING) this.crateAnim.set(r, [q, t, ANIM_MS]);
         this.emitDust(this.center(q), 10, [120, 100, 70]);
       } else if (k === "slide") {
+        // SLIDE EVENT: one tile of a sliding crate's travel. Extend the
+        // animation from wherever this crate started sliding.
         const [, a, b] = e;
         const [start, t0] = this.crateAnim.get(a) || [a, t, 0]; this.crateAnim.delete(a);
         const d = this.dist(start, b);
         this.crateAnim.set(b, [start, t0, Math.max(ANIM_MS, 60 * d)]);
         this.emitDust(this.center(a), 2, [120, 100, 70]);
       } else if (k === "fill") {
+        // FILL EVENT: a crate dropped into a pit. Hand the crate to the ghost
+        // list so it can finish falling, then splash.
         const [, p] = e;
         const [start, t0, dur] = this.crateAnim.get(p) || [p, t, ANIM_MS]; this.crateAnim.delete(p);
         this.ghosts.push(["crate", start, p, t0, dur]);
         this.emitSplash(this.center(p));
         this.texts.push({ x: this.center(p)[0], y: this.center(p)[1], text: "FILLED!", life: 0.9, color: "#c8aa78" });
       } else if (k === "teleport") {
+        // TELEPORT EVENT: ring both portals. A teleported crate must not tween
+        // across the map, so drop its animation entirely.
         const [, who, a, b] = e;
         this.emitPortal(this.center(a)); this.emitPortal(this.center(b));
         if (who === "crate") { this.crateAnim.delete(a); this.crateAnim.delete(b); }
       } else if (k === "spike") {
+        // SPIKE EVENT: a hand was caught by a raised spike. Burst, shake the
+        // screen, and the state is now dead until undo or restart.
         const [, p] = e;
         this.emitBurst(this.center(p), [240, 80, 80], 30); this.shake = 0.35;
         this.texts.push({ x: this.center(p)[0], y: this.center(p)[1], text: "OUCH!", life: 0.9, color: RED });
@@ -289,6 +449,7 @@ class Game {
     this.state.hands.forEach((h, i) => {                    // teleported hands: no cross-map tween
       if (this.handAnim.has(i) && this.dist(this.handAnim.get(i)[0], h) > 1) this.handAnim.delete(i);
     });
+    // DOOR EVENT: puff whenever a switch flips a door open or shut
     const doors = [this.level.redOpen(this.state.crates), this.level.greenOpen(this.state.crates)];
     if (doors[0] !== this.prevDoors[0]) for (const p of this.level.redDoors) this.emitBurst(this.center(p), [255, 120, 120], 14);
     if (doors[1] !== this.prevDoors[1]) {
@@ -296,39 +457,99 @@ class Game {
       for (const [p, ct] of this.state.crates) if (ct === GREEN) this.emitBurst(this.center(p), [120, 255, 140], 8);
     }
     this.prevDoors = doors;
+    // WIN EVENT: every hand is on a goal, so score the level and freeze it
     if (this.state.solved(this.level)) {
       this.scene = "clear"; this.clearTime = t;
-      this.earned = starsFor(this.state.moves, this.level.par);
+      this.earned = starsFor(this.state.moves, this.level.par, this.hintUsed);
       for (const h of this.state.hands) this.emitSparkle(this.center(h));
     }
   }
+  // UNDO EVENT (gameplay revision): pop the whole previous state back
   undo() {
     if (!this.undoStack.length) return;
     this.state = this.undoStack.pop();
     this.handAnim = new Map(); this.crateAnim = new Map(); this.ghosts = [];
+    this.cancelHint();
     this.prevDoors = [this.level.redOpen(this.state.crates), this.level.greenOpen(this.state.crates)];
     this.texts.push({ x: this.W / 2, y: this.oy + 20, text: "UNDO", life: 0.9, color: GREY });
   }
+
+  // ---------------- hint system (gameplay revision) ----------------
+  // HINT EVENT: start a search from the position currently on screen. The
+  // search runs in the background, so this only kicks it off.
+  askHint() {
+    if (this.state.dead || this.hintSolver || this.hintMoves.length) return;
+    this.hintSolver = new HintSolver(this.level, this.state);
+  }
+  // The board moved, so throw away the answer and any search in progress.
+  // hintUsed deliberately survives: the penalty is for the whole attempt, not
+  // for the one move the hint was asked about.
+  cancelHint() { this.hintSolver = null; this.hintMoves = []; }
+  // HINT STEP EVENT: called every frame while a search is running. The stars
+  // are charged here rather than on the key press, so a search that finds
+  // nothing useful costs the player nothing.
+  updateHint() {
+    if (!this.hintSolver) return;
+    this.hintSolver.step(HINT_SLICE_MS);
+    if (this.hintSolver.status === "ready" && this.hintSolver.moves.length) {
+      this.hintMoves = this.hintSolver.moves;
+      this.hintSolver = null;
+      this.hintUsed = true;
+      this.texts.push({ x: this.W / 2, y: this.oy + 20, text: "HINT: 0 STARS", life: 0.9, color: CYAN });
+    }
+  }
+  // One line for the HUD: what the hint system is currently saying.
+  hintStatus() {
+    if (this.hintMoves.length) {
+      const names = { left: "LEFT", right: "RIGHT", up: "UP", down: "DOWN" };
+      const n = this.hintMoves.length;
+      return [`Hint: press ${names[this.hintMoves[0]]}  (${n} move${n !== 1 ? "s" : ""} left)`, CYAN];
+    }
+    const s = this.hintSolver;
+    if (!s) return [null, null];
+    if (s.status === "working") return [`Thinking... ${Math.floor(s.progress() * 100)}%`, CYAN];
+    // The search emptied its queue, so "unsolvable" is proof and not a guess.
+    if (s.status === "unsolvable") return ["No way to win from here. Press Z to undo or R to restart.", RED];
+    return [`Searched ${HINT_BUDGET.toLocaleString()} positions and found no route. Press Z to undo or R to restart.`, RED];
+  }
+
+  // ===================== KEY PRESS EVENTS =====================
+  // Every key the game listens for has its own commented branch. Which keys
+  // are live depends on the scene, exactly like a GameMaker room.
   key(k) {
     if (this.scene === "title") {
-      if (k === "Enter" || k === " ") { this.stars = []; this.loadLevel(0); }
+      // TITLE: Enter or Space starts a fresh run
+      if (k === "Enter" || k === " ") { this.stars = []; this.hintLog = []; this.loadLevel(0); }
     } else if (this.scene === "results") {
+      // RESULTS: any key goes back to the title screen (Challenge 3)
       this.scene = "title";
     } else if (this.scene === "clear") {
+      // LEVEL CLEAR: ignore everything for 600ms so a key held down from the
+      // winning move cannot skip the star screen
       if (now() - this.clearTime < 600) return;
-      this.stars.push(this.earned);
-      if (this.levelIndex + 1 < this.levels.length) this.loadLevel(this.levelIndex + 1); else this.scene = "results";
+      const kl = k.length === 1 ? k.toLowerCase() : k;
+      if (kl === "r") {
+        // RETRY: replay this same level. Nothing is banked, so the score just
+        // set is thrown away and the next attempt starts clean (including the
+        // hint penalty).
+        this.loadLevel(this.levelIndex);
+      } else if (k === "Enter" || k === " ") {
+        // CONTINUE: bank this level's stars and move on, or finish the run
+        this.stars.push(this.earned); this.hintLog.push(this.hintUsed);
+        if (this.levelIndex + 1 < this.levels.length) this.loadLevel(this.levelIndex + 1); else this.scene = "results";
+      }
     } else if (this.scene === "play") {
       const kl = k.length === 1 ? k.toLowerCase() : k;
-      if (kl === "ArrowLeft" || kl === "a") this.tryMove("left");
-      else if (kl === "ArrowRight" || kl === "d") this.tryMove("right");
-      else if (kl === "ArrowUp" || kl === "w") this.tryMove("up");
-      else if (kl === "ArrowDown" || kl === "s") this.tryMove("down");
-      else if (kl === "z") this.undo();
-      else if (kl === "r") this.loadLevel(this.levelIndex);
-      else if (kl === "Escape") this.scene = "title";
+      if (kl === "ArrowLeft" || kl === "a") this.tryMove("left");         // MOVE LEFT
+      else if (kl === "ArrowRight" || kl === "d") this.tryMove("right");  // MOVE RIGHT
+      else if (kl === "ArrowUp" || kl === "w") this.tryMove("up");        // MOVE UP
+      else if (kl === "ArrowDown" || kl === "s") this.tryMove("down");    // MOVE DOWN
+      else if (kl === "z") this.undo();                                  // UNDO one move
+      else if (kl === "h") this.askHint();                               // HINT, at the cost of the stars
+      else if (kl === "r") this.loadLevel(this.levelIndex);              // RESTART the level
+      else if (kl === "Escape") this.scene = "title";                    // BACK TO TITLE, abandoning the run
       else if (kl === "n" && location.hash === "#debug") {      // level skip, testing only
-        this.stars.push(0);
+        this.stars.push(0); this.hintLog.push(this.hintUsed);
         if (this.levelIndex + 1 < this.levels.length) this.loadLevel(this.levelIndex + 1); else this.scene = "results";
       }
     }
@@ -416,6 +637,7 @@ class Game {
       const bob = st.sprites[i] === "hand" ? Math.sin(sec * 3 + i) * 2 : 0;
       c.drawImage(this.img[st.sprites[i]], x, y + bob, T, T);
     });
+    this.drawHintArrow();          // above the hands, below the particles
     for (const p of this.particles) {
       const a = Math.max(0, Math.min(1, p.life / p.maxLife)), s = Math.max(1, p.size * (0.4 + 0.6 * a));
       const f = 0.5 + 0.5 * a;
@@ -427,14 +649,40 @@ class Game {
       c.globalAlpha = Math.min(1, t.life / 0.4); this.text("bold 22px sans-serif", t.text, t.x, t.y, t.color); c.globalAlpha = 1;
     }
   }
+  // HINT DRAW EVENT: a pulsing arrow over every hand, pointing at the move the
+  // search recommends. Every hand moves together, so they all get one.
+  drawHintArrow() {
+    if (!this.hintMoves.length) return;
+    const c = this.ctx, [dx, dy] = DIRS[this.hintMoves[0]];
+    const pulse = 0.75 + 0.25 * Math.sin(now() / 1000 * 7);
+    for (const p of this.state.hands) {
+      let [cx, cy] = this.center(p);
+      cx += dx * T * 0.55; cy += dy * T * 0.55;
+      const tx = cx + dx * 14 * pulse, ty = cy + dy * 14 * pulse;     // arrow tip
+      const bx = cx - dx * 8, by = cy - dy * 8;                       // arrow base
+      const sx = -dy * 11, sy = dx * 11;                              // perpendicular
+      c.fillStyle = CYAN; c.beginPath();
+      c.moveTo(tx, ty); c.lineTo(bx + sx, by + sy); c.lineTo(bx - sx, by - sy);
+      c.closePath(); c.fill();
+    }
+  }
+
+  // ===================== DRAW GUI EVENT =====================
   drawHud() {
     const c = this.ctx, lv = this.level, st = this.state;
     c.fillStyle = HUD_BG; c.fillRect(0, 0, this.W, HUD_H);
     this.text("bold 20px sans-serif", `Level ${this.levelIndex + 1}/${this.levels.length}: ${lv.name}`, 14, 20, WHITE, "left");
+    // Challenge 2: the move counter, next to the par it is being judged against
     this.text("bold 20px sans-serif", `Moves: ${st.moves}   Par: ${lv.par}`, 14, 44, st.moves <= lv.par ? YELLOW : GREY, "left");
     this.text("15px sans-serif", `Stars: ${this.stars.reduce((a, b) => a + b, 0)}`, this.W - 14, 18, YELLOW, "right");
-    this.text("15px sans-serif", "Arrows/WASD move   Z undo   R restart   Esc title", this.W - 14, 42, GREY, "right");
-    this.text("15px sans-serif", lv.hint, this.W / 2, this.H - 22, "#bebecd");
+    this.text("15px sans-serif", "Arrows/WASD move   Z undo   H hint   R restart   Esc title", this.W - 14, 42, GREY, "right");
+    // Bottom line, in priority order: whatever the hint system is saying,
+    // then the standing reminder that this attempt cannot earn stars any
+    // more, and otherwise the level's own one-line tip.
+    let [msg, col] = this.hintStatus();
+    if (msg === null && this.hintUsed) { msg = "Hint used: this level now scores 0 stars. R restarts for a clean run."; col = CYAN; }
+    if (msg === null) { msg = lv.hint; col = "#bebecd"; }
+    this.text("15px sans-serif", msg, this.W / 2, this.H - 22, col);
   }
   drawStars(n, cx, cy, size = 40) {
     const c = this.ctx;
@@ -446,6 +694,7 @@ class Game {
     }
   }
   overlay(alpha) { this.ctx.fillStyle = `rgba(0,0,0,${alpha / 255})`; this.ctx.fillRect(0, 0, this.W, this.H); }
+  // Challenge 3: the title screen
   drawTitle() {
     const c = this.ctx, sec = now() / 1000;
     c.fillStyle = BG; c.fillRect(0, 0, this.W, this.H);
@@ -460,10 +709,13 @@ class Game {
       "Sliding crates keep going.  Green crates are ghosts until a green switch is pressed.",
       "Spikes rise every 2 moves.  Portals swap you (or a crate) to their twin.",
       "Fewer moves = more stars.  Every hand must reach a goal.",
+      "Stuck?  H asks for the next move, but that level then scores 0 stars.",
     ];
     lines.forEach((l, i) => this.text("15px sans-serif", l, this.W / 2, this.H * 0.52 + i * 24, "#c8c8d7"));
     if (Math.floor(sec * 2) % 2 === 0) this.text("bold 22px sans-serif", "Press ENTER to start", this.W / 2, this.H * 0.86, WHITE);
   }
+  // Challenge 3: after the last level the game reports the run and goes back
+  // to the title screen
   drawResults() {
     const c = this.ctx;
     c.fillStyle = BG; c.fillRect(0, 0, this.W, this.H);
@@ -472,15 +724,18 @@ class Game {
     this.text("bold 22px sans-serif", `Total stars: ${total} / ${3 * this.levels.length}`, this.W / 2, this.H * 0.32, WHITE);
     this.stars.forEach((s, i) => {
       const y = this.H * 0.42 + i * 34;
-      this.text("15px sans-serif", `${i + 1}. ${this.levels[i].name}`, this.W / 2 - 160, y, "#c8c8d7");
+      const label = `${i + 1}. ${this.levels[i].name}` + (this.hintLog[i] ? "  (hint used)" : "");
+      this.text("15px sans-serif", label, this.W / 2 - 160, y, "#c8c8d7");
       this.drawStars(s, this.W / 2 + 120, y, 22);
     });
     this.text("20px sans-serif", "Press any key to return to the title", this.W / 2, this.H * 0.92, GREY);
   }
+  // ===================== STEP EVENT =====================
   loop() {
     const t = now(), dt = Math.min(0.1, (t - this.last) / 1000); this.last = t;
     if (this.ready) {
       this.updateParticles(dt);
+      if (this.scene === "play") this.updateHint();   // advance the hint search a slice
       const c = this.ctx;
       if (this.scene === "title") this.drawTitle();
       else if (this.scene === "results") this.drawResults();
@@ -491,15 +746,18 @@ class Game {
         this.drawLevel(); this.drawHud();
         c.restore();
         if (this.state.dead) {
+          // DEATH OVERLAY: the only ways out are undo and restart
           this.overlay(120);
           this.text("bold 56px sans-serif", "OUCH!", this.W / 2, this.H / 2 - 20, RED);
           this.text("bold 22px sans-serif", "Z to undo   R to restart", this.W / 2, this.H / 2 + 30, WHITE);
         } else if (this.scene === "clear") {
+          // LEVEL CLEAR OVERLAY: continue, or retry this level
           this.overlay(150);
           this.text("bold 56px sans-serif", "LEVEL CLEAR", this.W / 2, this.H / 2 - 70, YELLOW);
           this.drawStars(this.earned, this.W / 2, this.H / 2);
           this.text("bold 22px sans-serif", `${this.state.moves} moves  (par ${this.level.par})`, this.W / 2, this.H / 2 + 50, WHITE);
-          if (t - this.clearTime > 600) this.text("15px sans-serif", "Press any key to continue", this.W / 2, this.H / 2 + 90, GREY);
+          if (this.hintUsed) this.text("15px sans-serif", "Hint used, so this level scores 0 stars", this.W / 2, this.H / 2 + 78, CYAN);
+          if (t - this.clearTime > 600) this.text("15px sans-serif", "ENTER / SPACE: next level      R: retry this level", this.W / 2, this.H / 2 + 104, GREY);
         }
       }
     }
