@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tic-Tac-Toe</title>
+<!--
+  Tic-Tac-Toe, HTML version. Open this file in any browser. Everything is
+  inside it: no images, no sound files, no libraries. The graphics are drawn
+  on a canvas and the sounds are synthesised with the Web Audio API.
+
+  Base game (Project 4 GML guide): 3x3 field held in a 2D array, blue stones
+  for the human, red for the computer, mouse to place, running score for wins
+  and draws, the loser of a round starts the next one, and the four step
+  computer strategy (win, block, centre, random).
+
+  Challenges from the guide (it lists #1, #4 and #5; there is no #2 or #3):
+    #1 Adaptive Game Play   level = (score_player + 1) / (score_computer + 1)
+    #4 Undo Button          take back the last player move and the reply
+    #5 Level Selection      Easy / Medium / Hard buttons, shown on screen
+
+  Changes, one per category from "How to Make Changes":
+    Category 1, Visual and Sound     particles, animated background, animated
+                                     win line, stone pop, 4 synthesised sounds
+    Category 2, Interactive Gameplay BOMB power-up, earned by winning a round,
+                                     spent to delete one computer stone
+    Category 3, Rules and Objectives match play, first to 3 round wins, with a
+                                     match summary screen
+
+  EVENT MAP (GameMaker calls these events; here they are methods of class Game)
+    Create event          constructor    once, builds the audio and the buttons
+    Room Start event      newMatch       resets scores and the field
+    Alarm0 event          update         the end of round pause
+    Step event            update         timers, particles, animation
+    Global Left Pressed   onClick        the only input the game takes
+    Draw event            drawField      board, stones, particles
+    Draw GUI event        drawHud        scores, difficulty, buttons
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #141822; color: #ecf0fa;
+               font-family: "Segoe UI", Helvetica, Arial, sans-serif; }
+  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  canvas { max-width: 100vw; max-height: 100vh; outline: none; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0"></canvas>
+<script>
+// ---------------------------------------------------------------------------
+//  Rules engine: a line for line port of the Python version, so the two
+//  versions are the same game rather than two games that look alike.
+// ---------------------------------------------------------------------------
+const EMPTY = 0, PLAYER = 1, COMPUTER = 2;
+
+// The eight lines that win, each as three [row, col] cells.
+const LINES = [
+  [[0,0],[0,1],[0,2]],      // three horizontal
+  [[1,0],[1,1],[1,2]],
+  [[2,0],[2,1],[2,2]],
+  [[0,0],[1,0],[2,0]],      // three vertical
+  [[0,1],[1,1],[2,1]],
+  [[0,2],[1,2],[2,2]],
+  [[0,0],[1,1],[2,2]],      // two diagonal
+  [[0,2],[1,1],[2,0]],
+];
+
+// Challenge #5: the difficulty settings, and which of the four strategy steps
+// each one is allowed to use. "Adaptive" is Challenge #1 and picks one of the
+// other three every move from the current score.
+const DIFFICULTIES = ["Easy", "Medium", "Hard", "Adaptive"];
+const STEPS = {
+  Easy:   ["random"],
+  Medium: ["win", "centre", "random"],
+  Hard:   ["win", "block", "centre", "random"],
+};
+
+// scr_field_clear: a fresh 3x3 grid with every cell empty.
+const fieldClear = () => [[0,0,0],[0,0,0],[0,0,0]];
+// A deep copy, which is what the undo stack stores (array_copy in GML).
+const fieldCopy = (f) => f.map(row => row.slice());
+
+// scr_check_player_win / scr_check_computer_win. Returns the winning line so
+// the front end can draw it, or null. A line is truthy and null is falsy, so
+// this still reads as a yes/no test.
+function checkWin(field, who) {
+  for (const line of LINES) {
+    if (line.every(([r, c]) => field[r][c] === who)) return line;
+  }
+  return null;
+}
+
+// scr_check_draw: true only when no cell is empty.
+function checkDraw(field) {
+  for (let row = 0; row < 3; row++)
+    for (let col = 0; col < 3; col++)
+      if (field[row][col] === EMPTY) return false;
+  return true;
+}
+
+function emptyCells(field) {
+  const out = [];
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++)
+    if (field[r][c] === EMPTY) out.push([r, c]);
+  return out;
+}
+
+// --- the four steps of the computer strategy -------------------------------
+// Try every empty cell. If putting a stone there wins, keep it.
+function findComputerWin(field) {
+  for (const [r, c] of emptyCells(field)) {
+    field[r][c] = COMPUTER;
+    if (checkWin(field, COMPUTER)) return true;
+    field[r][c] = EMPTY;            // put the cell back and try the next one
+  }
+  return false;
+}
+
+// The same search, but for the human. Found means block it, so the computer
+// stone goes in the cell the human needed.
+function findPlayerWin(field) {
+  for (const [r, c] of emptyCells(field)) {
+    field[r][c] = PLAYER;
+    if (checkWin(field, PLAYER)) { field[r][c] = COMPUTER; return true; }
+    field[r][c] = EMPTY;
+  }
+  return false;
+}
+
+// The guide only takes the centre half the time, to keep some variety.
+function findCentre(field, rng) {
+  if (rng() * 2 < 1 && field[1][1] === EMPTY) { field[1][1] = COMPUTER; return true; }
+  return false;
+}
+
+function findRandom(field, rng) {
+  const cells = emptyCells(field);
+  if (!cells.length) return false;
+  const [r, c] = cells[Math.floor(rng() * cells.length)];
+  field[r][c] = COMPUTER;
+  return true;
+}
+
+// Challenge #1. The guide's formula, verbatim:
+//   level = (score_player + 1) / (score_computer + 1)
+// above 1.2 the human is winning, so play everything;
+// below 0.5 the human is being beaten, so play random only.
+function adaptiveDifficulty(scorePlayer, scoreComputer) {
+  const level = (scorePlayer + 1) / (scoreComputer + 1);
+  if (level > 1.2) return "Hard";
+  if (level < 0.5) return "Easy";
+  return "Medium";
+}
+
+// scr_find_move. Runs the allowed steps in order and stops at the first one
+// that places a stone. Returns the difficulty actually used.
+function findMove(field, difficulty, scorePlayer, scoreComputer, rng) {
+  if (difficulty === "Adaptive") difficulty = adaptiveDifficulty(scorePlayer, scoreComputer);
+  for (const step of STEPS[difficulty]) {
+    if (step === "win" && findComputerWin(field)) break;
+    if (step === "block" && findPlayerWin(field)) break;
+    if (step === "centre" && findCentre(field, rng)) break;
+    if (step === "random" && findRandom(field, rng)) break;
+  }
+  return difficulty;
+}
+</script>
+<script>
+// ---------------------------------------------------------------------------
+//  Canvas front end
+// ---------------------------------------------------------------------------
+const W = 640, H = 620;
+const CELL = 140, BX = 110, BY = 92, BOARD = CELL * 3;
+const MSG_Y = BY + BOARD + 8;
+const BTN_Y = H - 56;
+const WIN_TARGET = 3;          // Change 3: first to this many round wins
+const END_PAUSE = 1.6;         // seconds the result stays up (the GML alarm)
+
+const BG = "#141822", PANEL = "#1c212e", GRID = "#3e4860", INK = "#ecf0fa";
+const COL = {
+  bg: "#141822", panel: "#1c212e", grid: "#3e4860", ink: "#ecf0fa",
+  muted: "#8a94ac", blue: "#569eff", red: "#f06262", gold: "#fcce54",
+  dim: "#242936", btn: "#282e3e", btnHover: "#343c50", btnOff: "#242935",
+  btnTextOff: "#5a6276",
+};
+const RGB = { blue: [86,158,255], red: [240,98,98], gold: [252,206,84], ink: [236,240,250] };
+
+const lerp = (a, b, t) => a + (b - a) * t;
+
+class Game {
+  // ===================== CREATE EVENT =====================
+  constructor(canvas) {
+    this.cv = canvas;
+    this.ctx = canvas.getContext("2d");
+    canvas.width = W; canvas.height = H;
+    this.rng = Math.random;
+    this.audio = null;          // created on the first click, see playSound
+    this.mx = -1; this.my = -1;
+    this.particles = [];
+    this.time = 0;
+    this.last = performance.now();
+    // Buttons: four difficulties on the left, undo, bomb and new on the right.
+    this.buttons = [];
+    DIFFICULTIES.forEach((name, i) =>
+      this.buttons.push({ x: 14 + i * 82, y: BTN_Y, w: 76, h: 42, label: name, tag: "diff:" + name, enabled: true }));
+    this.buttons.push({ x: 356, y: BTN_Y, w: 92, h: 42, label: "Undo", tag: "undo", enabled: true });
+    this.buttons.push({ x: 456, y: BTN_Y, w: 92, h: 42, label: "Bomb", tag: "bomb", enabled: true });
+    this.buttons.push({ x: 556, y: BTN_Y, w: 70, h: 42, label: "New", tag: "new", enabled: true });
+    this.difficulty = "Hard";
+    this.stars = [];
+    this.newMatch();
+    // MOUSE MOVE EVENT: remember where the pointer is, for the hover highlight
+    canvas.addEventListener("mousemove", e => {
+      const r = canvas.getBoundingClientRect();
+      this.mx = (e.clientX - r.left) * (W / r.width);
+      this.my = (e.clientY - r.top) * (H / r.height);
+    });
+    canvas.addEventListener("mouseleave", () => { this.mx = -1; this.my = -1; });
+    // GLOBAL LEFT PRESSED EVENT
+    canvas.addEventListener("mousedown", e => {
+      if (e.button !== 0) return;
+      const r = canvas.getBoundingClientRect();
+      this.onClick((e.clientX - r.left) * (W / r.width), (e.clientY - r.top) * (H / r.height));
+    });
+    // KEY PRESS EVENTS: keyboard shortcuts for the two buttons that have one
+    window.addEventListener("keydown", e => {
+      const k = e.key.toLowerCase();
+      if (k === "u") this.undo();            // undo
+      else if (k === "n") this.newMatch();   // new match
+    });
+    requestAnimationFrame(() => this.loop());
+  }
+
+  // --- Category 1: four sounds, synthesised so no files are needed ---------
+  // A browser will not let a page make noise until the user has interacted
+  // with it, so the AudioContext is built on the first click and not before.
+  playSound(name) {
+    try {
+      if (!this.audio) this.audio = new (window.AudioContext || window.webkitAudioContext)();
+      const ac = this.audio;
+      if (ac.state === "suspended") ac.resume();
+      const recipes = {
+        place: [[660, 0.07]],
+        win:   [[523, 0.10], [659, 0.10], [784, 0.10], [1047, 0.20]],
+        lose:  [[392, 0.14], [330, 0.14], [247, 0.26]],
+        draw:  [[440, 0.12], [440, 0.12]],
+        bomb:  [[180, 0.06], [120, 0.14]],
+      };
+      let t = ac.currentTime;
+      for (const [freq, dur] of recipes[name]) {
+        const osc = ac.createOscillator(), gain = ac.createGain();
+        osc.type = "sine"; osc.frequency.value = freq;
+        // A short ramp at each end stops the click you get from cutting a
+        // sine wave off mid cycle.
+        gain.gain.setValueAtTime(0, t);
+        gain.gain.linearRampToValueAtTime(0.22, t + 0.008);
+        gain.gain.linearRampToValueAtTime(0.0001, t + dur);
+        osc.connect(gain); gain.connect(ac.destination);
+        osc.start(t); osc.stop(t + dur + 0.01);
+        t += dur;
+      }
+    } catch (err) { /* no audio available, keep playing silently */ }
+  }
+
+  // ===================== ROOM START EVENT =====================
+  // scr_score_init plus the match state that Change 3 adds.
+  newMatch() {
+    this.scorePlayer = 0;
+    this.scoreComputer = 0;
+    this.scoreDraw = 0;
+    this.bombs = 0;              // Change 2: power-ups in hand
+    this.stars = [];
+    this.matchOver = false;
+    this.starter = PLAYER;       // the loser of a round starts the next one
+    this.newRound();
+  }
+
+  newRound() {
+    this.field = fieldClear();
+    this.gameOver = false;
+    this.gameOverMessage = "";
+    this.winLine = null;
+    this.endTimer = 0;           // the GML alarm, counted down in update()
+    this.undoStack = [];         // Challenge #4
+    this.bombArmed = false;
+    this.roundMoves = 0;
+    this.particles = [];
+    this.pops = new Map();       // "r,c" -> seconds since the stone landed
+    if (this.starter === COMPUTER) this.computerMove();
+  }
+
+  // ---------------- helpers ----------------
+  // What the computer would actually play right now. Only different from
+  // this.difficulty while Adaptive is selected (Challenge #1).
+  resolvedDifficulty() {
+    return this.difficulty === "Adaptive"
+      ? adaptiveDifficulty(this.scorePlayer, this.scoreComputer) : this.difficulty;
+  }
+  // Mark every stone as already finished popping, so a board that changed
+  // without a new stone (undo, bomb) does not replay the placement animation.
+  settlePops() {
+    this.pops = new Map();
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++)
+      if (this.field[r][c] !== EMPTY) this.pops.set(r + "," + c, 1);
+  }
+  cellRect(r, c) { return [BX + c * CELL, BY + r * CELL, CELL, CELL]; }
+  cellCentre(r, c) { const [x, y, w, h] = this.cellRect(r, c); return [x + w / 2, y + h / 2]; }
+  // scr_field_click's arithmetic: subtract the board offset, divide by the
+  // cell size, floor. Anything outside 0..2 is a click off the board.
+  cellAt(mx, my) {
+    const col = Math.floor((mx - BX) / CELL), row = Math.floor((my - BY) / CELL);
+    return (row >= 0 && row <= 2 && col >= 0 && col <= 2) ? [row, col] : null;
+  }
+  inButton(b, mx, my) { return b.enabled && mx >= b.x && mx < b.x + b.w && my >= b.y && my < b.y + b.h; }
+
+  // ===================== GLOBAL LEFT PRESSED EVENT =====================
+  onClick(mx, my) {
+    // BUTTON EVENT: the HUD gets first refusal on every click
+    for (const b of this.buttons) {
+      if (this.inButton(b, mx, my)) { this.onButton(b.tag); return; }
+    }
+    // MATCH OVER EVENT: any click on the board starts a new match
+    if (this.matchOver) { this.newMatch(); return; }
+    // ROUND OVER EVENT: clicking skips the rest of the result pause
+    if (this.gameOver) { this.endTimer = 0; return; }
+    const cell = this.cellAt(mx, my);
+    if (!cell) return;                 // outside the field, ignore
+    const [row, col] = cell;
+    // BOMB EVENT (Change 2): armed, so this click deletes a computer stone
+    if (this.bombArmed) {
+      if (this.field[row][col] === COMPUTER) {
+        this.field[row][col] = EMPTY;
+        this.bombs -= 1;
+        this.bombArmed = false;
+        this.undoStack = [];           // the board no longer matches the stack
+        this.settlePops();
+        this.burst(this.cellCentre(row, col), RGB.red, 26);
+        this.playSound("bomb");
+      }
+      return;                          // a bomb click never also places a stone
+    }
+    // PLACE STONE EVENT: only an empty cell does anything
+    if (this.field[row][col] !== EMPTY) return;
+    this.undoStack.push(fieldCopy(this.field));     // Challenge #4
+    this.field[row][col] = PLAYER;
+    this.pops.set(row + "," + col, 0);
+    this.roundMoves += 1;
+    this.playSound("place");
+    this.puff(this.cellCentre(row, col), RGB.blue);
+    // The guide's order: check the player, then let the computer reply, then
+    // check the computer.
+    if (this.checkEnd()) return;
+    this.computerMove();
+    this.checkEnd();
+  }
+
+  onButton(tag) {
+    if (tag.startsWith("diff:")) {
+      // Challenge #5: pick a difficulty. It takes effect on the next move.
+      this.difficulty = tag.slice(5);
+    } else if (tag === "undo") {
+      this.undo();
+    } else if (tag === "bomb") {
+      // Arming is a toggle, so a mis-click can be taken back.
+      if (this.bombs > 0 && !this.gameOver) this.bombArmed = !this.bombArmed;
+    } else if (tag === "new") {
+      this.newMatch();
+    }
+  }
+
+  // UNDO EVENT (Challenge #4): one step back, to just before the player's last
+  // move, which also removes the computer's reply to it. Only available while
+  // the round is still running, so a scored round cannot be rewritten.
+  undo() {
+    if (this.gameOver || !this.undoStack.length) return;
+    this.field = this.undoStack.pop();
+    this.settlePops();
+    this.bombArmed = false;
+    this.roundMoves = Math.max(0, this.roundMoves - 1);
+  }
+
+  // scr_find_move. Adaptive resolves to a real level inside findMove.
+  computerMove() {
+    findMove(this.field, this.difficulty, this.scorePlayer, this.scoreComputer, this.rng);
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
+      if (this.field[r][c] === COMPUTER && !this.pops.has(r + "," + c)) {
+        this.pops.set(r + "," + c, 0);
+        this.puff(this.cellCentre(r, c), RGB.red);
+        this.playSound("place");
+      }
+    }
+  }
+
+  // ===================== ROUND END LOGIC =====================
+  // scr_check_end. Updates a score, plays a sound, sets the message and starts
+  // the pause. Returns true when the round is over.
+  checkEnd() {
+    let line = checkWin(this.field, PLAYER);
+    if (line) {
+      this.scorePlayer += 1;
+      this.bombs += 1;                      // Change 2: a win buys a bomb
+      this.stars.push(this.rateRound());    // Change 3
+      this.finish("You win this round", line, PLAYER, "win");
+      return true;
+    }
+    line = checkWin(this.field, COMPUTER);
+    if (line) {
+      this.scoreComputer += 1;
+      this.stars.push(0);
+      this.finish("The computer wins this round", line, COMPUTER, "lose");
+      return true;
+    }
+    if (checkDraw(this.field)) {
+      this.scoreDraw += 1;
+      this.stars.push(1);
+      this.finish("A draw", null, null, "draw");
+      return true;
+    }
+    return false;
+  }
+
+  // Change 3: a star rating for a won round. Three stones is the fastest a
+  // player can possibly win, so that is 3 stars.
+  rateRound() {
+    if (this.roundMoves <= 3) return 3;
+    if (this.roundMoves === 4) return 2;
+    return 1;
+  }
+
+  finish(message, line, winner, sound) {
+    this.gameOver = true;
+    this.gameOverMessage = message;
+    this.winLine = line;
+    this.endTimer = END_PAUSE;
+    this.playSound(sound);
+    if (line) for (const [r, c] of line)
+      this.burst(this.cellCentre(r, c), winner === PLAYER ? RGB.blue : RGB.red, 18);
+    // The loser of a round starts the next one. A draw keeps the order.
+    if (winner === PLAYER) this.starter = COMPUTER;
+    else if (winner === COMPUTER) this.starter = PLAYER;
+    // Change 3: the match ends as soon as someone reaches the target.
+    if (this.scorePlayer >= WIN_TARGET || this.scoreComputer >= WIN_TARGET) this.matchOver = true;
+  }
+
+  // ---------------- particles (Category 1) ----------------
+  add(x, y, vx, vy, life, color, size) {
+    this.particles.push({ x, y, vx, vy, life, maxLife: life, color, size });
+  }
+  puff([cx, cy], color) {
+    for (let i = 0; i < 12; i++) {
+      const a = Math.random() * Math.PI * 2, s = 30 + Math.random() * 80;
+      this.add(cx, cy, Math.cos(a) * s, Math.sin(a) * s, 0.25 + Math.random() * 0.25, color, 2 + (i % 3));
+    }
+  }
+  burst([cx, cy], color, n) {
+    const cols = [color, RGB.gold, RGB.ink];
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, s = 60 + Math.random() * 160;
+      this.add(cx, cy, Math.cos(a) * s, Math.sin(a) * s, 0.4 + Math.random() * 0.5, cols[i % 3], 2 + (i % 4));
+    }
+  }
+
+  // ===================== STEP EVENT =====================
+  update(dt) {
+    this.time += dt;
+    // ALARM0 EVENT: the result pause has run out, so clear for the next round
+    if (this.gameOver && !this.matchOver) {
+      this.endTimer -= dt;
+      if (this.endTimer <= 0) this.newRound();
+    }
+    this.particles = this.particles.filter(p => {
+      p.life -= dt;
+      if (p.life <= 0) return false;
+      p.vy += 260 * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+      return true;
+    });
+    for (const k of this.pops.keys()) this.pops.set(k, this.pops.get(k) + dt);
+  }
+
+  // ---------------- drawing helpers ----------------
+  text(font, s, x, y, color, align = "left") {
+    const c = this.ctx;
+    c.font = font; c.fillStyle = color; c.textAlign = align; c.textBaseline = "top";
+    c.fillText(s, x, y);
+  }
+  centreText(font, s, y, color) {
+    const c = this.ctx;
+    c.font = font; c.fillStyle = color; c.textAlign = "center"; c.textBaseline = "middle";
+    c.fillText(s, W / 2, y);
+  }
+  roundRect(x, y, w, h, r) {
+    const c = this.ctx;
+    c.beginPath();
+    if (c.roundRect) c.roundRect(x, y, w, h, r);
+    else {                       // fallback for an older browser
+      c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r);
+      c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r);
+      c.arcTo(x, y, x + w, y, r); c.closePath();
+    }
+  }
+
+  // ===================== DRAW EVENT =====================
+  drawField() {
+    const c = this.ctx;
+    // Animated background: three slow drifting glows behind the board.
+    const glowCols = [RGB.blue, RGB.red, RGB.gold];
+    for (let i = 0; i < 3; i++) {
+      const t = this.time * 0.35 + i * 2.1;
+      const gx = W / 2 + Math.cos(t) * 190;
+      const gy = BY + BOARD / 2 + Math.sin(t * 0.8) * 140;
+      const g = c.createRadialGradient(gx, gy, 0, gx, gy, 120);
+      const [r0, g0, b0] = glowCols[i];
+      g.addColorStop(0, `rgba(${r0},${g0},${b0},0.09)`);
+      g.addColorStop(1, `rgba(${r0},${g0},${b0},0)`);
+      c.fillStyle = g; c.beginPath(); c.arc(gx, gy, 120, 0, Math.PI * 2); c.fill();
+    }
+    c.fillStyle = COL.panel;
+    this.roundRect(BX - 10, BY - 10, BOARD + 20, BOARD + 20, 16); c.fill();
+    const hover = this.gameOver ? null : this.cellAt(this.mx, this.my);
+    for (let r = 0; r < 3; r++) for (let col = 0; col < 3; col++) {
+      const [x, y, w, h] = this.cellRect(r, col);
+      // Hover highlight, and a red tint while a bomb is armed.
+      if (hover && hover[0] === r && hover[1] === col) {
+        const legal = this.bombArmed ? this.field[r][col] === COMPUTER : this.field[r][col] === EMPTY;
+        if (legal) {
+          const [cr, cg, cb] = this.bombArmed ? RGB.red : RGB.blue;
+          c.fillStyle = `rgba(${cr},${cg},${cb},${(28 + 14 * Math.sin(this.time * 5)) / 255})`;
+          c.fillRect(x + 4, y + 4, w - 8, h - 8);
+        }
+      }
+      c.strokeStyle = COL.grid; c.lineWidth = 2;
+      this.roundRect(x, y, w, h, 10); c.stroke();
+      const v = this.field[r][col];
+      if (v === EMPTY) continue;
+      // Stone pop: the stone scales up over its first 140 ms.
+      const t = Math.min(1, (this.pops.get(r + "," + col) ?? 1) / 0.14);
+      const rad = lerp(14, 46, t * (2 - t));           // ease out
+      c.fillStyle = v === PLAYER ? COL.blue : COL.red;
+      c.beginPath(); c.arc(x + w / 2, y + h / 2, rad, 0, Math.PI * 2); c.fill();
+      c.fillStyle = "#ffffff";
+      c.beginPath(); c.arc(x + w / 2 - rad / 3, y + h / 2 - rad / 3, Math.max(2, rad / 5), 0, Math.PI * 2); c.fill();
+    }
+    // Animated win line: it draws itself across the three cells.
+    if (this.winLine) {
+      const t = this.matchOver ? 1 : Math.min(1, (END_PAUSE - this.endTimer) / 0.35);
+      const [ax, ay] = this.cellCentre(...this.winLine[0]);
+      const [bx, by] = this.cellCentre(...this.winLine[2]);
+      c.strokeStyle = COL.gold; c.lineWidth = 8; c.lineCap = "round";
+      c.beginPath(); c.moveTo(ax, ay); c.lineTo(lerp(ax, bx, t), lerp(ay, by, t)); c.stroke();
+    }
+    for (const p of this.particles) {
+      const k = Math.max(0, Math.min(1, p.life / p.maxLife)), f = 0.35 + 0.65 * k;
+      c.fillStyle = `rgb(${p.color[0] * f | 0},${p.color[1] * f | 0},${p.color[2] * f | 0})`;
+      c.fillRect(p.x | 0, p.y | 0, p.size, p.size);
+    }
+  }
+
+  // ===================== DRAW GUI EVENT =====================
+  drawHud() {
+    const c = this.ctx;
+    c.fillStyle = COL.panel; c.fillRect(0, 0, W, 84);
+    this.text("bold 26px sans-serif", "TIC-TAC-TOE", 16, 14, COL.ink);
+    // Challenge #5 asks for the difficulty to be on screen. While Adaptive is
+    // selected it also shows what the formula picks at the current score.
+    let label = this.difficulty;
+    if (this.difficulty === "Adaptive") label += " (now " + this.resolvedDifficulty() + ")";
+    this.text("16px sans-serif", "Difficulty: " + label, 16, 50, COL.muted);
+    // The three score variables from the guide.
+    this.text("16px sans-serif", "You " + this.scorePlayer, W - 200, 16, COL.blue);
+    this.text("16px sans-serif", "Computer " + this.scoreComputer, W - 130, 16, COL.red);
+    this.text("16px sans-serif", "Draws " + this.scoreDraw, W - 200, 40, COL.muted);
+    this.text("16px sans-serif", "Bombs " + this.bombs, W - 130, 40, COL.gold);
+    // Change 3: how the match stands, drawn as a row of pips per side.
+    this.text("16px sans-serif", "First to " + WIN_TARGET, W - 200, 62, COL.muted);
+    for (let i = 0; i < WIN_TARGET; i++) {
+      c.fillStyle = i < this.scorePlayer ? COL.blue : COL.grid;
+      c.beginPath(); c.arc(W - 118 + i * 18, 70, 6, 0, Math.PI * 2); c.fill();
+      c.fillStyle = i < this.scoreComputer ? COL.red : COL.grid;
+      c.beginPath(); c.arc(W - 58 + i * 18, 70, 6, 0, Math.PI * 2); c.fill();
+    }
+    // Message strip under the board.
+    const [msg, mcol] = this.statusLine();
+    this.text("16px sans-serif", msg, W / 2, MSG_Y, mcol, "center");
+    // Buttons.
+    for (const b of this.buttons) {
+      const selected = b.tag === "diff:" + this.difficulty;
+      if (b.tag === "undo") b.enabled = this.undoStack.length > 0 && !this.gameOver;
+      else if (b.tag === "bomb") b.enabled = this.bombs > 0 && !this.gameOver;
+      const armed = b.tag === "bomb" && this.bombArmed;
+      let fill;
+      if (selected) fill = COL.blue;
+      else if (armed) fill = COL.red;
+      else if (!b.enabled) fill = COL.btnOff;
+      else if (this.inButton(b, this.mx, this.my)) fill = COL.btnHover;
+      else fill = COL.btn;
+      c.fillStyle = fill; this.roundRect(b.x, b.y, b.w, b.h, 10); c.fill();
+      let label = b.label;
+      if (b.tag === "bomb" && this.bombs) label += " x" + this.bombs;
+      c.font = "16px sans-serif"; c.textAlign = "center"; c.textBaseline = "middle";
+      c.fillStyle = b.enabled ? COL.ink : COL.btnTextOff;
+      c.fillText(label, b.x + b.w / 2, b.y + b.h / 2);
+    }
+  }
+
+  statusLine() {
+    if (this.matchOver) {
+      const who = this.scorePlayer > this.scoreComputer ? "You win the match" : "The computer wins the match";
+      return [who + ". Click the board for a new match.", COL.gold];
+    }
+    if (this.gameOver) return [this.gameOverMessage, COL.gold];
+    if (this.bombArmed) return ["Bomb armed: click a red stone to delete it.", COL.red];
+    return ["Your turn. Click an empty cell.", COL.muted];
+  }
+
+  // Change 3: the match summary, including the per round star rating.
+  drawMatchOver() {
+    const c = this.ctx;
+    c.fillStyle = "rgba(0,0,0,0.72)"; c.fillRect(0, 0, W, H);
+    const won = this.scorePlayer > this.scoreComputer;
+    this.centreText("bold 56px sans-serif", won ? "YOU WIN" : "COMPUTER WINS", H * 0.22, won ? COL.gold : COL.red);
+    this.centreText("26px sans-serif",
+      `${this.scorePlayer} - ${this.scoreComputer}   (${this.scoreDraw} draws)`, H * 0.32, COL.ink);
+    this.centreText("16px sans-serif", "Round by round", H * 0.39, COL.muted);
+    this.stars.forEach((st, i) =>
+      this.centreText("16px sans-serif",
+        `Round ${i + 1}: ` + (st ? "*".repeat(st) : "no stars"), H * 0.45 + i * 26, COL.ink));
+    this.centreText("16px sans-serif", "Click anywhere for a new match", H * 0.88, COL.muted);
+  }
+
+  // ===================== STEP EVENT (frame driver) =====================
+  loop() {
+    const t = performance.now();
+    const dt = Math.min(0.1, (t - this.last) / 1000);
+    this.last = t;
+    this.update(dt);
+    const c = this.ctx;
+    c.fillStyle = COL.bg; c.fillRect(0, 0, W, H);
+    this.drawField();
+    this.drawHud();
+    if (this.matchOver) this.drawMatchOver();
+    requestAnimationFrame(() => this.loop());
+  }
+}
+const game = new Game(document.getElementById("game"));
+window.game = game;
+</script>
+</body>
+</html>
