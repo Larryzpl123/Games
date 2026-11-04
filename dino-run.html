@@ -52,6 +52,36 @@
 <script>
 /* ============================================================
    DINO INFINITE RUNNER, v11
+   ============================================================
+
+   Base game (Project 3 guide): a dino that runs, jumps and ducks past cacti,
+   birds and floating blocks, with a score, a game over and a restart.
+   Challenges: #1 randomised spawn intervals that shorten over time,
+               #2 fixed block heights and birds that can still reach a blocked
+                  player, #3 a day and night cycle.
+   Changes:    four biomes + weather + generated sound (visual and sound),
+               double jump / fast fall / landable blocks (gameplay),
+               staged unlocks + milestones + saved high score (rules).
+
+   EVENT MAP. The guide builds this in GameMaker, where behaviour hangs off
+   per object events. There is no engine here, so each of those events is a
+   plain function and the fixed step loop at the bottom calls them in order:
+
+     Create event          loadAllSprites      once, builds every sprite + mask
+     Room Start event      room_start          resets the whole run
+     Alarm 0               alarm0              spawn one ground / flying obstacle
+     Alarm 1               alarm1              spawn one floating block
+     Alarm 2               alarm2              add score, fire milestones
+     Step event            step                one tick: alarms, timers, world
+     Key Press / Release   the keydown, keyup, mousedown and touchstart
+                           listeners, which only set flags on `input`; the flags
+                           are read inside stepDino so input is handled on the
+                           tick and not whenever the browser feels like it
+     Collision event       checkCollisions     dino against every obstacle
+     Draw event            drawScene           background, world, HUD, game over
+
+   One step is always 1/60 s (STEP_MS). The loop catches up with however many
+   whole steps are owed, so the game runs identically on a slow or fast screen.
    ============================================================ */
 
 const ROOM_W = 1366, ROOM_H = 768;
@@ -69,6 +99,8 @@ const hintEl = document.getElementById('hint');
 const HINT_FONT_PX = 22;   // size in room pixels, scaled with the canvas
 let hintColor = '#808080'; // cached so the DOM is only touched when the color changes
 
+// Scale the stage to the window, keeping the 1366x768 aspect. The canvas keeps its
+// room-pixel size; only its CSS size changes, so nothing inside has to know.
 function fitCanvas() {
   const s = Math.min(window.innerWidth / ROOM_W, window.innerHeight / ROOM_H) * 0.96;
   const w = (ROOM_W * s) + 'px';
@@ -97,11 +129,14 @@ const SPRITE_DEFS = {
 };
 const SPR = {};
 
+// Load one PNG. Wrapped in a Promise so loadAllSprites can await them all at once.
 function loadImage(src) {
   return new Promise((res, rej) => { const img = new Image();
     img.onload = () => res(img); img.onerror = () => rej(new Error('load ' + src)); img.src = src; });
 }
 
+// Cut a strip of n frames into separate canvases, and build an alpha mask per frame
+// (1 = solid pixel). The masks are what pixelCollide uses, so collision is per pixel.
 function buildSprite(img, n) {
   const fw = Math.floor(img.width / n), fh = img.height;
   const frames = [], masks = [];
@@ -117,6 +152,7 @@ function buildSprite(img, n) {
   return { frames, masks, w: fw, h: fh, n };
 }
 
+// Same as buildSprite but for a sprite drawn in code: one frame, one mask.
 function buildFromCanvas(c) {
   const cx = c.getContext('2d');
   const data = cx.getImageData(0, 0, c.width, c.height).data;
@@ -125,6 +161,8 @@ function buildFromCanvas(c) {
   return { frames: [c], masks: [m], w: c.width, h: c.height, n: 1 };
 }
 
+// Recolour a sprite by painting over only its opaque pixels ('source-atop'), so one
+// block and one ground sprite can serve all four biomes instead of four copies each.
 function washSprite(spr, color) {
   if (!color) return spr;
   const frames = spr.frames.map(f => {
@@ -142,6 +180,7 @@ function washSprite(spr, color) {
 }
 
 /* --- Procedural obstacle sprites --- */
+// The floating block: a grey bar with a white border.
 function buildBlockSprite() {
   const c = document.createElement('canvas'); c.width = 200; c.height = 30;
   const x = c.getContext('2d');
@@ -149,6 +188,7 @@ function buildBlockSprite() {
   x.fillStyle = '#9a9a9a'; x.fillRect(5, 5, 190, 20);
   return buildFromCanvas(c);
 }
+// Forest biome, large obstacle: trunk plus three overlapping canopy blobs.
 function buildTree() {
   const c = document.createElement('canvas'); c.width = 90; c.height = 130;
   const x = c.getContext('2d');
@@ -164,6 +204,7 @@ function buildTree() {
   x.beginPath(); x.arc(60, 60, 15, 0, Math.PI*2); x.fill();
   return buildFromCanvas(c);
 }
+// Forest biome, small obstacle: two low blobs with a lighter one on top.
 function buildBush() {
   const c = document.createElement('canvas'); c.width = 70; c.height = 55;
   const x = c.getContext('2d');
@@ -174,6 +215,7 @@ function buildBush() {
   x.beginPath(); x.arc(35, 24, 22, 0, Math.PI*2); x.fill();
   return buildFromCanvas(c);
 }
+// Ocean biome, large obstacle: four branching stems with rounded tips.
 function buildCoral() {
   const c = document.createElement('canvas'); c.width = 85; c.height = 120;
   const x = c.getContext('2d');
@@ -191,6 +233,7 @@ function buildCoral() {
   x.fillRect(62, 25, 3, 75);
   return buildFromCanvas(c);
 }
+// Ocean biome, small obstacle: two bezier fronds.
 function buildSeaweed() {
   const c = document.createElement('canvas'); c.width = 65; c.height = 95;
   const x = c.getContext('2d');
@@ -207,6 +250,7 @@ function buildSeaweed() {
   x.stroke();
   return buildFromCanvas(c);
 }
+// Ocean biome, flyer: body, tail fin, top fin, eye.
 function buildFish() {
   const c = document.createElement('canvas'); c.width = 92; c.height = 55;
   const x = c.getContext('2d');
@@ -223,6 +267,7 @@ function buildFish() {
   x.beginPath(); x.arc(22, 26, 3, 0, Math.PI*2); x.fill();
   return buildFromCanvas(c);
 }
+// Forest biome, flyer: translucent wings, striped body, head and sting.
 function buildBee() {
   const c = document.createElement('canvas'); c.width = 70; c.height = 55;
   const x = c.getContext('2d');
@@ -242,6 +287,7 @@ function buildBee() {
   x.beginPath(); x.moveTo(52, 32); x.lineTo(64, 34); x.lineTo(52, 36); x.closePath(); x.fill();
   return buildFromCanvas(c);
 }
+// Stone biome, flyer: body, ears, two curved wings, glowing eyes.
 function buildBat() {
   const c = document.createElement('canvas'); c.width = 80; c.height = 50;
   const x = c.getContext('2d');
@@ -261,6 +307,7 @@ function buildBat() {
   x.beginPath(); x.arc(43, 14, 2, 0, Math.PI*2); x.fill();
   return buildFromCanvas(c);
 }
+// Stone biome, large obstacle: a column shaded light to dark, with a crack.
 function buildPillar() {
   const c = document.createElement('canvas'); c.width = 70; c.height = 120;
   const x = c.getContext('2d');
@@ -271,6 +318,7 @@ function buildPillar() {
   x.fillStyle = '#5a5a5a'; x.fillRect(32, 42, 3, 22); x.fillRect(35, 58, 5, 16);
   return buildFromCanvas(c);
 }
+// Stone biome, small obstacle: an angular boulder with a lit face.
 function buildRock() {
   const c = document.createElement('canvas'); c.width = 70; c.height = 55;
   const x = c.getContext('2d');
@@ -375,7 +423,9 @@ const choose = (...a) => a[Math.floor(Math.random() * a.length)];
 const irandom_range = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const lerp = (a, b, t) => a + (b - a) * t;
+// Zero-pad the score. The HUD font is monospace, so padding keeps HI from shifting.
 function pad(n, len = 5) { return String(Math.floor(n)).padStart(len, '0'); }
+// Fisher-Yates on a copy. Used to order the biome queue.
 function shuffle(a) {
   a = a.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -384,6 +434,9 @@ function shuffle(a) {
   }
   return a;
 }
+// COLLISION TEST. Intersect the two bounding boxes first, then compare the alpha
+// masks inside that overlap only. Per pixel rather than per box is what makes ducking
+// work: the duck sprite is the same height, its solid pixels just sit lower.
 function pixelCollide(ax, ay, as, af, bx, by, bs, bf) {
   ax = Math.round(ax); ay = Math.round(ay); bx = Math.round(bx); by = Math.round(by);
   const x0 = Math.max(ax, bx), x1 = Math.min(ax + as.w, bx + bs.w);
@@ -396,6 +449,8 @@ function pixelCollide(ax, ay, as, af, bx, by, bs, bf) {
   }
   return false;
 }
+// Would a rectangle touch anything already on screen (plus a margin)? Used to refuse
+// a spawn that would land on top of an existing obstacle or block.
 function rectOverlapsAny(r, margin) {
   for (const o of obstacles) {
     const s = SPR[o.sprite];
@@ -408,6 +463,7 @@ function rectOverlapsAny(r, margin) {
   }
   return false;
 }
+// Right edge of the obstacle furthest along, or -Infinity when the screen is empty.
 function rightmostObstacleEdge() {
   let maxX = -Infinity;
   for (const o of obstacles) {
@@ -416,6 +472,8 @@ function rightmostObstacleEdge() {
   }
   return maxX === -Infinity ? -Infinity : maxX;
 }
+// Smallest spacing allowed between obstacles. Grows with speed, because at speed the
+// player has less time to react and a fixed gap stops being clearable.
 function minObstacleGap() {
   return Math.round(MIN_GAP_BASE + ctrl.speed * MIN_GAP_PER_SPEED);
 }
@@ -423,6 +481,7 @@ function minObstacleGap() {
 /* --- High score --- */
 let highscore = 0;
 try { highscore = Number(localStorage.getItem('dinoRunnerHigh')) || 0; } catch (e) {}
+// Persist the high score. Wrapped in try/catch: private windows can throw here.
 function saveHigh() { try { localStorage.setItem('dinoRunnerHigh', String(highscore)); } catch (e) {} }
 
 /* --- Load --- */
@@ -463,6 +522,8 @@ let nightShown = false;
 let biomeQueue = [], nextBiomeScore = 0, lastBiome = null;
 let pendingObstacle = null;
 
+// Next biome from a shuffled queue, refilled when empty. If the refill would repeat
+// the biome just played, swap it to the far end so the same one never comes twice.
 function popNextBiome() {
   if (biomeQueue.length === 0) {
     biomeQueue = shuffle(ALL_BIOMES);
@@ -474,10 +535,14 @@ function popNextBiome() {
   lastBiome = biomeQueue.pop();
   return lastBiome;
 }
+// Score at which the next biome change happens, 700 to 1300 points from now.
 function rollNextBiomeScore() {
   return ctrl.score + irandom_range(BIOME_MIN_SCORE, BIOME_MAX_SCORE);
 }
 
+// ROOM START EVENT. Rebuilds every piece of run state: the controller and its three
+// alarms, the dino, the obstacle and block lists, the biome queue and the weather.
+// Everything that must not survive a death is reset here and nowhere else.
 function room_start() {
   ctrl = { alarm: [90, 300, SCORE_ALARM], score: 0, speed: SPEED_START, steps: 0,
     bgOffset: 0, dayTimer: 0, night: false, deathTimer: 0,
@@ -503,17 +568,21 @@ function room_start() {
   nightShown = false;
   nightVeil.style.opacity = '0';
 }
+// Restarting is just starting again; nothing is carried over except the high score.
 function room_restart() { room_start(); }
 
 /* --- Sound (generated with Web Audio, no files needed) --- */
 let audioCtx = null;
+// Browsers refuse to make sound until the user has interacted, so the AudioContext is
+// created from inside the input handlers rather than at load.
 function ensureAudio() {
-  // Browsers only allow audio after a user gesture, so this runs from input handlers
   try {
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === 'suspended') audioCtx.resume();
   } catch (e) { audioCtx = null; }
 }
+// One short oscillator note with an exponential fade, optionally sliding to another
+// pitch. Every sound effect in the game is built out of this.
 function beep(freq, dur, opts = {}) {
   if (!audioCtx || audioCtx.state !== 'running') return;
   const t0 = audioCtx.currentTime + (opts.delay || 0);
@@ -555,13 +624,17 @@ window.addEventListener('keyup', (e) => {
 });
 window.addEventListener('blur', () => { input.jumpHeld = false; input.down = false; });
 
+// Mouse or touch position converted from screen pixels back into room coordinates.
 function pointerPos(e) {
   const r = canvas.getBoundingClientRect();
   const t = e.touches ? e.touches[0] : e;
   return { x: (t.clientX - r.left) / r.width * ROOM_W, y: (t.clientY - r.top) / r.height * ROOM_H };
 }
+// Hit box of the replay icon in the top right corner.
 function replayBounds() { const s = SPR.spr_replay; return { x: ROOM_W - s.w - 24, y: 24, w: s.w, h: s.h }; }
 
+// Pointer down: the replay icon restarts, a dead dino restarts after a short lockout,
+// anything else counts as a jump press.
 function onPress(e) {
   e.preventDefault(); ensureAudio(); if (!ctrl) return;
   const p = pointerPos(e), rb = replayBounds();
@@ -569,6 +642,7 @@ function onPress(e) {
   if (dino.dead) { if (ctrl.deathTimer > 20) room_restart(); return; }
   input.jumpPressed = true; input.jumpHeld = true;
 }
+// Pointer up: release the jump key flag.
 function onRelease() { input.jumpHeld = false; }
 canvas.addEventListener('mousedown', onPress);
 window.addEventListener('mouseup', onRelease);
@@ -576,6 +650,8 @@ canvas.addEventListener('touchstart', onPress, { passive: false });
 window.addEventListener('touchend', onRelease);
 
 /* --- Biome transition --- */
+// Switch biome once the score passes the threshold and start a 3 second cross-fade.
+// Weather is cleared at the same time, so a biome never keeps the previous one's sky.
 function updateBiome() {
   if (ctrl.score >= nextBiomeScore) {
     biomePrev = biomeCur;
@@ -605,6 +681,8 @@ function startMeteorDrain() {
   weather.particles = weather.particles.filter(p => p.x - meteorHalo(p) < ROOM_W);
 }
 
+// Weather tick: count down the current spell, maybe roll a new one for this biome,
+// then move every particle. Each type drifts differently and wraps around the screen.
 function updateWeather() {
   const w = weather;
   w.timer--;
@@ -675,6 +753,7 @@ function updateWeather() {
   }
 }
 
+// One particle for a given weather type, with the spread and speed that type needs.
 function newParticle(type) {
   if (type === 'rain')      return { x: Math.random() * ROOM_W, y: Math.random() * ROOM_H, vy: 8 + Math.random() * 4, vx: 2 };
   if (type === 'snow')      return { x: Math.random() * ROOM_W, y: Math.random() * ROOM_H, vy: 1 + Math.random() * 2, size: 1 + Math.random() * 3 };
@@ -692,23 +771,31 @@ function newParticle(type) {
 }
 
 /* --- Controller alarms --- */
+// How long until the next obstacle, in steps. Challenge #1: a random draw rather than
+// a constant, and both ends of the range are divided by speed so the gaps close up as
+// the run goes on. The max(...) floors stop it collapsing to nothing at top speed.
 function obstacleInterval() {
   const lo = Math.max(55, Math.round(700 / ctrl.speed));
   const hi = Math.max(90, Math.round(1200 / ctrl.speed));
   return irandom_range(lo, hi);
 }
+// Same idea for blocks, on a longer timer so they stay an occasional feature.
 function blockInterval() {
   const lo = Math.max(180, Math.round(2000 / ctrl.speed));
   const hi = Math.max(260, Math.round(3200 / ctrl.speed));
   return irandom_range(lo, hi);
 }
 
+// Put an obstacle on the spawn line. Small cacti pick one of their three frames.
 function makeObstacle(spriteName, y, isFlyer) {
   const o = { sprite: spriteName, x: SPAWN_X, y, image_index: 0, animTimer: 0, isFlyer: !!isFlyer };
   if (spriteName === 'spr_cactus_s') o.image_index = choose(0, 1, 2);
   obstacles.push(o);
 }
 
+// Spawn unless it would overlap something or crowd the last obstacle. A refused
+// request is parked in pendingObstacle and retried next step instead of being lost,
+// so a dense moment delays obstacles rather than silently deleting them.
 function trySpawnObstacle(spriteName, y, isFlyer) {
   const s = SPR[spriteName];
   const r = { x: SPAWN_X, y, w: s.w, h: s.h };
@@ -726,6 +813,9 @@ function trySpawnObstacle(spriteName, y, isFlyer) {
   return true;
 }
 
+// ALARM 0: spawn one obstacle. Which kinds are allowed depends on the score (large
+// from 200, flyers from 450), so the run introduces one new threat at a time. Then
+// re-arm with a fresh random interval, which is Challenge #1.
 function alarm0() {
   const set = BIOME_OBSTACLES[biomeCur];
   const canLarge   = ctrl.score >= GATE_LARGE;
@@ -755,6 +845,8 @@ function alarm0() {
   ctrl.alarm[0] = obstacleInterval();
 }
 
+// ALARM 1: spawn one floating block, only after score 800. The height is picked from
+// BLOCK_TOPS rather than generated, which is Challenge #2.
 function alarm1() {
   if (ctrl.score < GATE_BLOCK) { ctrl.alarm[1] = 120; return; }
   const y = choose(...BLOCK_TOPS);
@@ -764,6 +856,8 @@ function alarm1() {
   ctrl.alarm[1] = blockInterval();
 }
 
+// ALARM 2: the score tick. Gains more per tick at higher speed, so going fast pays.
+// Fires the milestone flash and chime on every hundred crossed.
 function alarm2() {
   const before = ctrl.score;
   ctrl.score += 1 + Math.floor((ctrl.speed - SPEED_START) * 0.5);
@@ -776,6 +870,10 @@ function alarm2() {
 }
 
 /* --- Step --- */
+// STEP EVENT. One tick of the whole game: retry a held back spawn, count the three
+// alarms down and fire them, creep the speed up, advance the day/night timer, update
+// the biome and the weather, ease the weather's physics multipliers in, then move the
+// dino and the world and test for a collision. Nothing here draws.
 function step() {
   if (!dino.dead) {
     if (pendingObstacle) {
@@ -806,14 +904,21 @@ function step() {
   stepDino(); stepWorld(); checkCollisions();
 }
 
+// Is the dino resting on a surface? True on the ground, or on a block it overlaps.
 function standingOn() {
   const feet = dino.y + 94;
   if (Math.abs(feet - GROUND_Y) < 0.5) return true;
   for (const b of blocks) if (Math.abs(feet - b.y) < 0.5 && overlapsX(b)) return true;
   return false;
 }
+// Horizontal overlap between the dino and a block, inset so a pixel of corner does
+// not count as standing on it.
 function overlapsX(b) { return dino.x + 70 > b.x && dino.x + 16 < b.x + b.w; }
 
+// The dino's tick: jump and double jump off the press flag, gravity (scaled by the
+// weather and by fast fall), then landing. Landing compares the feet before and after
+// the move, so a fast fall cannot pass straight through a thin block in one step.
+// Finally pick the sprite for the current state and advance its animation.
 function stepDino() {
   const d = dino, grounded = standingOn();
   if (!d.dead) {
@@ -851,13 +956,16 @@ function stepDino() {
   }
 }
 
+// Scroll everything the dino does not control: ground offset, clouds, obstacles and
+// blocks, flapping the flyers that have more than one frame, and dropping anything
+// that has left the left edge.
 function stepWorld() {
   const moving = !dino.dead, sp = moving ? ctrl.speed * ctrl.fxSpeed : 0;
   ctrl.bgOffset = (ctrl.bgOffset + sp) % SPR.spr_ground1.w;
   for (const c of ctrl.clouds) { c.x -= sp * 0.25; if (c.x < -120) { c.x = ROOM_W + 60 + Math.random() * 300; c.y = 120 + Math.random() * 160; } }
   for (let i = obstacles.length - 1; i >= 0; i--) {
     const o = obstacles[i]; o.x -= sp;
-    if (o.isFlyer && moving) {
+    if (o.isFlyer && moving && SPR[o.sprite].n > 1) {
       if (++o.animTimer >= ANIM_STEPS) { o.animTimer = 0; o.image_index = 1 - o.image_index; }
     }
     if (o.x + SPR[o.sprite].w <= 0) obstacles.splice(i, 1);
@@ -865,6 +973,9 @@ function stepWorld() {
   for (let i = blocks.length - 1; i >= 0; i--) { blocks[i].x -= sp; if (blocks[i].x + blocks[i].w <= 0) blocks.splice(i, 1); }
 }
 
+// COLLISION EVENT. Any pixel overlap with any obstacle kills the dino: stop the three
+// alarms, save the high score, play the death sound. Blocks are not checked here
+// because they are landed on, not crashed into.
 function checkCollisions() {
   if (dino.dead) return;
   const ds = SPR[dino.sprite];
@@ -881,8 +992,10 @@ function checkCollisions() {
 }
 
 /* --- Drawing --- */
+// Draw one sprite frame at integer pixels, so nothing comes out blurred.
 function drawSpr(name, frame, x, y) { const s = SPR[name]; ctx.drawImage(s.frames[frame % s.n], Math.round(x), Math.round(y)); }
 
+// Background colour part way through a biome cross-fade.
 function currentBg() {
   const a = BG_COLORS[biomePrev] || BG_COLORS[biomeCur];
   const b = BG_COLORS[biomeCur];
@@ -894,6 +1007,9 @@ function currentBg() {
   ];
 }
 
+// DRAW EVENT. Back to front: background, meteors, clouds, ground, blocks, obstacles,
+// dino, weather, then the HUD and the game over panel. Reads state only, never
+// changes it, so the drawing can be skipped on a slow frame without affecting play.
 function drawScene() {
   const bg = currentBg();
   ctx.fillStyle = `rgb(${bg[0]},${bg[1]},${bg[2]})`;
@@ -953,6 +1069,7 @@ function drawScene() {
   }
 }
 
+// Blocks during a cross-fade: the old biome's tint fading out under the new one.
 function drawBlocks() {
   const paint = (name, alpha) => {
     ctx.globalAlpha = alpha;
@@ -1008,6 +1125,7 @@ function drawMeteors() {
   ctx.globalAlpha = 1;
 }
 
+// Rain, snow, sandstorm and bubbles. Meteors are drawn earlier, behind everything.
 function drawWeather() {
   const w = weather;
   if (!w.type) return;
@@ -1035,6 +1153,10 @@ function drawWeather() {
 /* --- Fixed-step loop --- */
 const STEP_MS = 1000 / 60;
 let acc = 0, last = performance.now();
+// FIXED STEP LOOP. Add the real elapsed time to an accumulator and run as many whole
+// 1/60 s steps as it owes, then draw once. A slow frame runs several steps instead of
+// one big one, so physics never changes with the frame rate. dt is capped so that
+// returning to a backgrounded tab does not run thousands of steps at once.
 function loop(now) {
   requestAnimationFrame(loop);
   let dt = now - last; last = now;
